@@ -1,0 +1,42 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_DB: aksrtblog
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      RUST_API_BIND: 0.0.0.0:4000
+      RUST_API_DATABASE_URL: postgres://postgres:${DB_PASSWORD:-changeme}@db:5432/aksrtblog
+      RUST_API_UPLOADS_DIR: /app/storage/uploads
+      RUST_API_FRONTEND_DIR:
+      RUST_API_CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      RUST_API_PUBLIC_SITE_URL: ${SITE_URL:-http://localhost:3000}
+    volumes:
+      - uploads:/app/storage/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  uploads:

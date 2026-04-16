@@ -1,0 +1,6 @@
+# 二进制文件 (由 CI/CD 或本地编译生成)
+aksrtblog-rust-api
+
+# 编译产物
+target/
+target-*/

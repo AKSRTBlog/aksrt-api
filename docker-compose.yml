@@ -1,42 +1,47 @@
 version: "3.8"
 
 services:
+  # PostgreSQL 数据库
   db:
     image: postgres:16-alpine
+    container_name: aksrtblog-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
+      POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
-      POSTGRES_DB: aksrtblog
+      POSTGRES_DB: ${DB_NAME:-aksrtblog}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
     ports:
-      - "5432:5432"
+      - "${DB_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
       interval: 5s
       timeout: 5s
       retries: 5
 
+  # Rust API 服务
   api:
     build: .
+    image: lexo0522/aksrtblog-api:latest
+    container_name: aksrtblog-api
     restart: unless-stopped
     ports:
       - "4000:4000"
     environment:
       RUST_API_BIND: 0.0.0.0:4000
-      RUST_API_DATABASE_URL: postgres://postgres:${DB_PASSWORD:-changeme}@db:5432/aksrtblog
+      # 支持外部数据库：优先使用外部地址，否则使用 docker-compose 内部网络
+      RUST_API_DATABASE_URL: ${EXTERNAL_DB_URL:-postgres://${DB_USER:-postgres}:${DB_PASSWORD:-changeme}@db:${DB_PORT:-5432}/${DB_NAME:-aksrtblog}}
       RUST_API_UPLOADS_DIR: /app/storage/uploads
       RUST_API_FRONTEND_DIR:
       RUST_API_CORS_ORIGIN: ${CORS_ORIGIN:-*}
       RUST_API_PUBLIC_SITE_URL: ${SITE_URL:-http://localhost:3000}
     volumes:
-      - uploads:/app/storage/uploads
+      - ${UPLOADS_DIR:-./data/uploads}:/app/storage/uploads
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
   pgdata:
-  uploads:

@@ -2366,7 +2366,7 @@ fn load_public_admin_avatar_url(conn: &mut PgClient) -> Result<Option<String>, A
         return Ok(None);
     }
 
-    Ok(Some(cravatar_url(trimmed_email)))
+    Ok(Some(cravatar_url_with_size(trimmed_email, 256)))
 }
 
 fn load_admin_session_by_id(
@@ -2562,6 +2562,15 @@ fn cravatar_url(email: &str) -> String {
     let normalized = email.trim().to_lowercase();
     let hash = format!("{:x}", md5::compute(normalized.as_bytes()));
     format!("https://cravatar.cn/avatar/{}?s=80&d=identicon", hash)
+}
+
+fn cravatar_url_with_size(email: &str, size: u32) -> String {
+    let normalized = email.trim().to_lowercase();
+    let hash = format!("{:x}", md5::compute(normalized.as_bytes()));
+    format!(
+        "https://cravatar.cn/avatar/{}?s={}&d=identicon",
+        hash, size
+    )
 }
 
 async fn get_public_site_settings(

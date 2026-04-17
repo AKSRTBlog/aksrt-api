@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS public_site_settings (
   police_filing TEXT,
   show_filing BOOLEAN NOT NULL DEFAULT FALSE,
   github_username TEXT,
+  about_display_name TEXT,
+  about_bio TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

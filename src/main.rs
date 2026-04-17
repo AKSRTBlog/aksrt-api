@@ -67,6 +67,17 @@ struct ApiEnvelope<T: Serialize> {
     timestamp: String,
 }
 
+impl ApiEnvelope<()> {
+    fn error(code: &'static str, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            data: (),
+            timestamp: Utc::now().to_rfc3339(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct NavigationItemRecord {
@@ -149,6 +160,9 @@ struct PublicSiteSettingsItem {
     police_filing: Option<String>,
     show_filing: bool,
     github_username: Option<String>,
+    about_display_name: Option<String>,
+    about_bio: Option<String>,
+    admin_avatar_url: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -667,6 +681,8 @@ struct UpdatePublicSiteSettingsInput {
     police_filing: Option<Option<String>>,
     show_filing: Option<bool>,
     github_username: Option<Option<String>>,
+    about_display_name: Option<Option<String>>,
+    about_bio: Option<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -2322,6 +2338,37 @@ fn load_active_admin_emails(conn: &mut PgClient) -> Result<Vec<String>, ApiError
         .collect())
 }
 
+fn load_public_admin_avatar_url(conn: &mut PgClient) -> Result<Option<String>, ApiError> {
+    let row = conn
+        .query_opt(
+            "SELECT email, avatar_url
+             FROM admins
+             WHERE status = 'active'
+             ORDER BY created_at ASC
+             LIMIT 1",
+            &[],
+        )
+        .map_err(db_error)?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let email: String = row.get(0);
+    let avatar_url: Option<String> = row.get(1);
+
+    if let Some(value) = normalize_optional_text(avatar_url) {
+        return Ok(Some(value));
+    }
+
+    let trimmed_email = email.trim();
+    if trimmed_email.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(cravatar_url(trimmed_email)))
+}
+
 fn load_admin_session_by_id(
     conn: &mut PgClient,
     session_id: &str,
@@ -2836,6 +2883,7 @@ fn read_public_site_settings(
     fallback_site_url: &str,
 ) -> Result<PublicSiteSettingsItem, ApiError> {
     let settings = read_public_settings_data(conn, fallback_site_url)?;
+    let admin_avatar_url = load_public_admin_avatar_url(conn)?;
 
     let mut navigation_items = settings
         .navigation_items
@@ -2887,6 +2935,9 @@ fn read_public_site_settings(
         police_filing: settings.police_filing,
         show_filing: settings.show_filing,
         github_username: settings.github_username,
+        about_display_name: settings.about_display_name,
+        about_bio: settings.about_bio,
+        admin_avatar_url,
     })
 }
 
@@ -2910,6 +2961,8 @@ struct PublicSettingsData {
     police_filing: Option<String>,
     show_filing: bool,
     github_username: Option<String>,
+    about_display_name: Option<String>,
+    about_bio: Option<String>,
 }
 
 fn read_public_settings_data(
@@ -2918,7 +2971,7 @@ fn read_public_settings_data(
 ) -> Result<PublicSettingsData, ApiError> {
     let row = conn
         .query_opt(
-            "SELECT site_title, site_description, logo_url, footer_text, comment_enabled, seo_title, seo_description, seo_keywords, seo_canonical_url, navigation_items_json::text, footer_links_json::text, standalone_pages_json::text, custom_head_code, custom_footer_code, icp_filing, police_filing, show_filing, github_username
+            "SELECT site_title, site_description, logo_url, footer_text, comment_enabled, seo_title, seo_description, seo_keywords, seo_canonical_url, navigation_items_json::text, footer_links_json::text, standalone_pages_json::text, custom_head_code, custom_footer_code, icp_filing, police_filing, show_filing, github_username, about_display_name, about_bio
              FROM public_site_settings
              WHERE id = $1",
             &[&"default-public-settings"],
@@ -2944,6 +2997,8 @@ fn read_public_settings_data(
     let police_filing: Option<String> = row.get(15);
     let show_filing: bool = row.get(16);
     let github_username: Option<String> = row.get(17);
+    let about_display_name: Option<String> = row.get(18);
+    let about_bio: Option<String> = row.get(19);
 
     let mut navigation_items = parse_json_records::<NavigationItemRecord>(&navigation_items_json)?;
     navigation_items.sort_by_key(|item| item.sort_order);
@@ -2985,6 +3040,8 @@ fn read_public_settings_data(
         police_filing,
         show_filing,
         github_username,
+        about_display_name,
+        about_bio,
     })
 }
 

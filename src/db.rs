@@ -6,6 +6,9 @@ use uuid::Uuid;
 
 use crate::*;
 
+const INITIAL_SCHEMA_SQL: &str = include_str!("../migrations/001_initial.sql");
+const SMTP_CLEANUP_SQL: &str = include_str!("../migrations/002_remove_smtp_replyto_and_notify.sql");
+
 pub(crate) struct Database<'a> {
     conn: &'a mut PgClient,
 }
@@ -55,8 +58,10 @@ impl<'a> Database<'a> {
     }
 
     pub(crate) fn ensure_default_records(&mut self, config: &Config) -> Result<(), ApiError> {
+        self.ensure_base_schema()?;
         self.ensure_media_asset_schema()?;
         self.ensure_page_view_schema()?;
+        self.ensure_public_site_settings_schema()?;
 
         let admin_exists = self
             .conn
@@ -121,12 +126,14 @@ impl<'a> Database<'a> {
                         seo_title, seo_description, seo_keywords, seo_canonical_url,
                         navigation_items_json, footer_links_json, standalone_pages_json,
                         custom_head_code, custom_footer_code, icp_filing, police_filing, show_filing, github_username,
+                        about_display_name, about_bio,
                         created_at, updated_at
                      ) VALUES (
                         $1, $2, $3, $4, $5, $6,
                         $7, $8, $9, $10,
                         '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
                         NULL, NULL, NULL, NULL, FALSE, NULL,
+                        NULL, NULL,
                         NOW(), NOW()
                      )",
                     &[
@@ -315,6 +322,12 @@ impl<'a> Database<'a> {
         Ok(())
     }
 
+    fn ensure_base_schema(&mut self) -> Result<(), ApiError> {
+        self.conn.batch_execute(INITIAL_SCHEMA_SQL).map_err(db_error)?;
+        self.conn.batch_execute(SMTP_CLEANUP_SQL).map_err(db_error)?;
+        Ok(())
+    }
+
     fn ensure_media_asset_schema(&mut self) -> Result<(), ApiError> {
         self.conn
             .batch_execute(
@@ -354,6 +367,18 @@ impl<'a> Database<'a> {
                 );
                 CREATE INDEX IF NOT EXISTS idx_page_views_created_at ON page_views(created_at);
                 CREATE INDEX IF NOT EXISTS idx_page_views_path ON page_views(path);",
+            )
+            .map_err(db_error)?;
+
+        Ok(())
+    }
+
+    fn ensure_public_site_settings_schema(&mut self) -> Result<(), ApiError> {
+        self.conn
+            .batch_execute(
+                "ALTER TABLE public_site_settings
+                    ADD COLUMN IF NOT EXISTS about_display_name TEXT,
+                    ADD COLUMN IF NOT EXISTS about_bio TEXT;",
             )
             .map_err(db_error)?;
 
@@ -745,6 +770,14 @@ impl<'a> Database<'a> {
             Some(value) => normalize_optional_text(value),
             None => current.github_username.clone(),
         };
+        let about_display_name = match input.about_display_name {
+            Some(value) => normalize_optional_text(value),
+            None => current.about_display_name.clone(),
+        };
+        let about_bio = match input.about_bio {
+            Some(value) => normalize_optional_text(value),
+            None => current.about_bio.clone(),
+        };
         let show_filing = input.show_filing.unwrap_or(current.show_filing);
 
         require_length(
@@ -778,14 +811,32 @@ impl<'a> Database<'a> {
                 ));
             }
         }
+        if let Some(display_name) = about_display_name.as_ref() {
+            require_length(
+                display_name,
+                1,
+                120,
+                "INVALID_ABOUT_DISPLAY_NAME",
+                "About display name is invalid",
+            )?;
+        }
+        if let Some(bio) = about_bio.as_ref() {
+            require_length(
+                bio,
+                1,
+                1000,
+                "INVALID_ABOUT_BIO",
+                "About bio is invalid",
+            )?;
+        }
 
         self.conn
             .execute(
                 "UPDATE public_site_settings
                  SET site_title = $1, site_description = $2, logo_url = $3, footer_text = $4, comment_enabled = $5,
                      seo_keywords = $6, custom_head_code = $7, custom_footer_code = $8, icp_filing = $9, police_filing = $10,
-                     show_filing = $11, github_username = $12, updated_at = NOW()
-                 WHERE id = $13",
+                     show_filing = $11, github_username = $12, about_display_name = $13, about_bio = $14, updated_at = NOW()
+                 WHERE id = $15",
                 &[
                     &site_title,
                     &site_description,
@@ -799,6 +850,8 @@ impl<'a> Database<'a> {
                     &police_filing,
                     &show_filing,
                     &github_username,
+                    &about_display_name,
+                    &about_bio,
                     &"default-public-settings",
                 ],
             )

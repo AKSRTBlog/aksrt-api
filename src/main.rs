@@ -165,6 +165,12 @@ struct PublicSiteSettingsItem {
     admin_avatar_url: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PublicSyncVersionItem {
+    version: String,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct StandalonePageSummaryItem {
@@ -1192,6 +1198,7 @@ async fn main() {
             "/api/v1/public/site-settings/captcha",
             get(get_public_captcha_config),
         )
+        .route("/api/v1/public/sync-version", get(get_public_sync_version))
         .route("/api/v1/public/articles", get(list_public_articles))
         .route(
             "/api/v1/public/articles/meta/categories",
@@ -3924,6 +3931,39 @@ async fn get_activity_stats(State(state): State<AppState>) -> Result<impl IntoRe
     run_blocking(move || {
         let mut conn = open_connection(&state)?;
         Ok(ok(build_activity_stats(&mut conn)?))
+    })
+    .await
+}
+
+fn read_public_sync_version(conn: &mut PgClient) -> Result<String, ApiError> {
+    let row = conn
+        .query_one(
+            "SELECT GREATEST(
+                COALESCE((SELECT MAX(updated_at) FROM public_site_settings), TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                COALESCE((SELECT MAX(updated_at) FROM articles), TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                COALESCE((SELECT MAX(updated_at) FROM article_categories), TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                COALESCE((SELECT MAX(updated_at) FROM article_tags), TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                COALESCE((SELECT MAX(created_at) FROM article_category_links), TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                COALESCE((SELECT MAX(created_at) FROM article_tag_links), TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                COALESCE((SELECT MAX(updated_at) FROM banners), TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                COALESCE((SELECT MAX(updated_at) FROM projects), TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                COALESCE((SELECT MAX(updated_at) FROM comments), TIMESTAMPTZ '1970-01-01 00:00:00+00'),
+                COALESCE((SELECT MAX(updated_at) FROM friend_link_applications), TIMESTAMPTZ '1970-01-01 00:00:00+00')
+            )::text",
+            &[],
+        )
+        .map_err(db_error)?;
+
+    let version: String = row.get(0);
+    Ok(version)
+}
+
+async fn get_public_sync_version(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    run_blocking(move || {
+        let mut conn = open_connection(&state)?;
+        Ok(ok(PublicSyncVersionItem {
+            version: read_public_sync_version(&mut conn)?,
+        }))
     })
     .await
 }

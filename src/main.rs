@@ -1667,10 +1667,41 @@ fn validate_url(value: &str) -> bool {
 }
 
 fn validate_contact_url(value: &str) -> bool {
-    value.starts_with("http://")
-        || value.starts_with("https://")
-        || value.starts_with("mailto:")
-        || value.starts_with("tel:")
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("javascript:")
+        || lower.starts_with("data:")
+        || lower.starts_with("vbscript:")
+        || lower.starts_with("file:")
+    {
+        return false;
+    }
+
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("tel:")
+    {
+        return true;
+    }
+
+    // Allow custom schemes such as tencent://, weixin://, tg://, etc.
+    match lower.split_once(':') {
+        Some((scheme, _)) => {
+            let mut chars = scheme.chars();
+            match chars.next() {
+                Some(first) if first.is_ascii_alphabetic() => {}
+                _ => return false,
+            }
+
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-')
+        }
+        None => false,
+    }
 }
 
 fn extract_client_meta(headers: &HeaderMap) -> (Option<String>, Option<String>) {
@@ -4277,6 +4308,14 @@ async fn admin_change_password(
                 StatusCode::BAD_REQUEST,
                 "INVALID_PASSWORD",
                 "Current password is incorrect",
+            ));
+        }
+
+        if input.current_password == input.new_password {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_PASSWORD",
+                "New password must be different from current password",
             ));
         }
 

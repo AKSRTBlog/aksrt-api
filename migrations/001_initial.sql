@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS public_site_settings (
   github_username TEXT,
   about_display_name TEXT,
   about_bio TEXT,
+  about_contacts_json JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

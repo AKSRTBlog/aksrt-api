@@ -6,9 +6,6 @@ use uuid::Uuid;
 
 use crate::*;
 
-const INITIAL_SCHEMA_SQL: &str = include_str!("../migrations/001_initial.sql");
-const SMTP_CLEANUP_SQL: &str = include_str!("../migrations/002_remove_smtp_replyto_and_notify.sql");
-
 pub(crate) struct Database<'a> {
     conn: &'a mut PgClient,
 }
@@ -58,7 +55,6 @@ impl<'a> Database<'a> {
     }
 
     pub(crate) fn ensure_default_records(&mut self, config: &Config) -> Result<(), ApiError> {
-        self.ensure_base_schema()?;
         self.ensure_media_asset_schema()?;
         self.ensure_page_view_schema()?;
         self.ensure_public_site_settings_schema()?;
@@ -105,8 +101,6 @@ impl<'a> Database<'a> {
             let site_description = env::var("SITE_DEFAULT_DESCRIPTION")
                 .unwrap_or_else(|_| "Personal blog about engineering and writing".to_string());
             let logo_url = normalize_optional_text(env::var("SITE_DEFAULT_LOGO_URL").ok());
-            let footer_text = env::var("SITE_DEFAULT_FOOTER_TEXT")
-                .unwrap_or_else(|_| "Powered by AKSRT Blog".to_string());
             let comment_enabled = env::var("SITE_DEFAULT_COMMENT_ENABLED")
                 .unwrap_or_else(|_| "true".to_string())
                 == "true";
@@ -122,18 +116,18 @@ impl<'a> Database<'a> {
             self.conn
                 .execute(
                     "INSERT INTO public_site_settings (
-                        id, site_title, site_description, logo_url, footer_text, comment_enabled,
+                        id, site_title, site_description, logo_url, comment_enabled,
                         seo_title, seo_description, seo_keywords, seo_canonical_url,
                         navigation_items_json, footer_links_json, standalone_pages_json,
                         custom_head_code, custom_footer_code, icp_filing, police_filing, show_filing, github_username,
-                        about_display_name, about_bio,
+                        about_display_name, about_bio, about_contacts_json,
                         created_at, updated_at
                      ) VALUES (
-                        $1, $2, $3, $4, $5, $6,
-                        $7, $8, $9, $10,
+                        $1, $2, $3, $4, $5,
+                        $6, $7, $8, $9, $10,
                         '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
                         NULL, NULL, NULL, NULL, FALSE, NULL,
-                        NULL, NULL,
+                        NULL, NULL, '[]'::jsonb,
                         NOW(), NOW()
                      )",
                     &[
@@ -141,7 +135,6 @@ impl<'a> Database<'a> {
                         &site_title,
                         &site_description,
                         &logo_url,
-                        &footer_text,
                         &comment_enabled,
                         &seo_title,
                         &seo_description,
@@ -322,12 +315,6 @@ impl<'a> Database<'a> {
         Ok(())
     }
 
-    fn ensure_base_schema(&mut self) -> Result<(), ApiError> {
-        self.conn.batch_execute(INITIAL_SCHEMA_SQL).map_err(db_error)?;
-        self.conn.batch_execute(SMTP_CLEANUP_SQL).map_err(db_error)?;
-        Ok(())
-    }
-
     fn ensure_media_asset_schema(&mut self) -> Result<(), ApiError> {
         self.conn
             .batch_execute(
@@ -378,7 +365,9 @@ impl<'a> Database<'a> {
             .batch_execute(
                 "ALTER TABLE public_site_settings
                     ADD COLUMN IF NOT EXISTS about_display_name TEXT,
-                    ADD COLUMN IF NOT EXISTS about_bio TEXT;",
+                    ADD COLUMN IF NOT EXISTS about_bio TEXT,
+                    ADD COLUMN IF NOT EXISTS about_contacts_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    ADD COLUMN IF NOT EXISTS article_layout TEXT NOT NULL DEFAULT 'list';",
             )
             .map_err(db_error)?;
 
@@ -738,11 +727,20 @@ impl<'a> Database<'a> {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or(current.site_description.clone());
-        let footer_text = input
-            .footer_text
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(current.footer_text.clone());
+        let site_title_changed = site_title != current.site_title;
+        let site_description_changed = site_description != current.site_description;
+        // Admin public settings currently edit site title/description directly.
+        // Keep SEO title/description aligned so social crawlers don't keep stale defaults.
+        let seo_title = if site_title_changed {
+            site_title.clone()
+        } else {
+            current.seo_title.clone()
+        };
+        let seo_description = if site_description_changed {
+            site_description.clone()
+        } else {
+            current.seo_description.clone()
+        };
         let comment_enabled = input.comment_enabled.unwrap_or(current.comment_enabled);
         let seo_keywords = input
             .seo_keywords
@@ -778,6 +776,57 @@ impl<'a> Database<'a> {
             Some(value) => normalize_optional_text(value),
             None => current.about_bio.clone(),
         };
+        let about_contacts = match input.about_contacts {
+            Some(items) => {
+                if items.len() > 20 {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "INVALID_ABOUT_CONTACTS",
+                        "Too many about contacts",
+                    ));
+                }
+
+                items
+                    .into_iter()
+                    .map(|item| {
+                        let name = item.name.trim().to_string();
+                        let url = item.url.trim().to_string();
+
+                        require_length(
+                            &name,
+                            1,
+                            80,
+                            "INVALID_ABOUT_CONTACT_NAME",
+                            "About contact name is invalid",
+                        )?;
+                        require_length(
+                            &url,
+                            1,
+                            500,
+                            "INVALID_ABOUT_CONTACT_URL",
+                            "About contact URL is invalid",
+                        )?;
+                        if !validate_contact_url(&url) {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                "INVALID_ABOUT_CONTACT_URL",
+                                "About contact URL is invalid",
+                            ));
+                        }
+
+                        let id = item
+                            .id
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+                        Ok(AboutContactRecord { id, name, url })
+                    })
+                    .collect::<Result<Vec<_>, ApiError>>()?
+            }
+            None => current.about_contacts.clone(),
+        };
+        let about_contacts_json = serialize_json_value(&about_contacts)?;
         let show_filing = input.show_filing.unwrap_or(current.show_filing);
 
         require_length(
@@ -793,13 +842,6 @@ impl<'a> Database<'a> {
             300,
             "INVALID_SITE_DESCRIPTION",
             "Site description is invalid",
-        )?;
-        require_length(
-            &footer_text,
-            1,
-            300,
-            "INVALID_FOOTER_TEXT",
-            "Footer text is invalid",
         )?;
         if let Some(url) = logo_url.as_ref() {
             require_length(url, 1, 500, "INVALID_LOGO_URL", "Logo URL is invalid")?;
@@ -833,16 +875,17 @@ impl<'a> Database<'a> {
         self.conn
             .execute(
                 "UPDATE public_site_settings
-                 SET site_title = $1, site_description = $2, logo_url = $3, footer_text = $4, comment_enabled = $5,
-                     seo_keywords = $6, custom_head_code = $7, custom_footer_code = $8, icp_filing = $9, police_filing = $10,
-                     show_filing = $11, github_username = $12, about_display_name = $13, about_bio = $14, updated_at = NOW()
-                 WHERE id = $15",
+                 SET site_title = $1, site_description = $2, logo_url = $3, comment_enabled = $4,
+                     seo_title = $5, seo_description = $6, seo_keywords = $7, custom_head_code = $8, custom_footer_code = $9, icp_filing = $10, police_filing = $11,
+                     show_filing = $12, github_username = $13, about_display_name = $14, about_bio = $15, about_contacts_json = $16::jsonb, updated_at = NOW()
+                 WHERE id = $17",
                 &[
                     &site_title,
                     &site_description,
                     &logo_url,
-                    &footer_text,
                     &comment_enabled,
+                    &seo_title,
+                    &seo_description,
                     &seo_keywords,
                     &custom_head_code,
                     &custom_footer_code,
@@ -852,6 +895,7 @@ impl<'a> Database<'a> {
                     &github_username,
                     &about_display_name,
                     &about_bio,
+                    &about_contacts_json,
                     &"default-public-settings",
                 ],
             )
@@ -934,7 +978,7 @@ impl<'a> Database<'a> {
                         "Footer link is invalid",
                     ));
                 }
-                if !validate_url(&href) {
+                if !validate_url(&href) && !href.starts_with('/') {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         "INVALID_FOOTER_LINK",

@@ -102,6 +102,14 @@ struct FooterLinkRecord {
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct AboutContactRecord {
+    id: String,
+    name: String,
+    url: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct StandalonePageRecord {
     id: String,
     title: String,
@@ -149,7 +157,6 @@ struct PublicSiteSettingsItem {
     site_title: String,
     site_description: String,
     logo_url: Option<String>,
-    footer_text: String,
     comment_enabled: bool,
     seo: SeoMeta,
     navigation_items: Vec<NavigationItemItem>,
@@ -162,7 +169,9 @@ struct PublicSiteSettingsItem {
     github_username: Option<String>,
     about_display_name: Option<String>,
     about_bio: Option<String>,
+    about_contacts: Vec<AboutContactRecord>,
     admin_avatar_url: Option<String>,
+    article_layout: String,
 }
 
 #[derive(Serialize)]
@@ -678,7 +687,6 @@ struct UpdatePublicSiteSettingsInput {
     site_title: Option<String>,
     site_description: Option<String>,
     logo_url: Option<Option<String>>,
-    footer_text: Option<String>,
     comment_enabled: Option<bool>,
     seo_keywords: Option<String>,
     custom_head_code: Option<String>,
@@ -689,6 +697,16 @@ struct UpdatePublicSiteSettingsInput {
     github_username: Option<Option<String>>,
     about_display_name: Option<Option<String>>,
     about_bio: Option<Option<String>>,
+    about_contacts: Option<Vec<UpdateAboutContactInput>>,
+    article_layout: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateAboutContactInput {
+    id: Option<String>,
+    name: String,
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -1646,6 +1664,13 @@ fn validate_email(value: &str) -> bool {
 
 fn validate_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
+}
+
+fn validate_contact_url(value: &str) -> bool {
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("mailto:")
+        || value.starts_with("tel:")
 }
 
 fn extract_client_meta(headers: &HeaderMap) -> (Option<String>, Option<String>) {
@@ -2935,7 +2960,6 @@ fn read_public_site_settings(
         site_title: settings.site_title.clone(),
         site_description: settings.site_description.clone(),
         logo_url: settings.logo_url,
-        footer_text: settings.footer_text,
         comment_enabled: settings.comment_enabled,
         seo: SeoMeta {
             title: settings.seo_title,
@@ -2953,7 +2977,9 @@ fn read_public_site_settings(
         github_username: settings.github_username,
         about_display_name: settings.about_display_name,
         about_bio: settings.about_bio,
+        about_contacts: settings.about_contacts,
         admin_avatar_url,
+        article_layout: settings.article_layout,
     })
 }
 
@@ -2962,7 +2988,6 @@ struct PublicSettingsData {
     site_title: String,
     site_description: String,
     logo_url: Option<String>,
-    footer_text: String,
     comment_enabled: bool,
     seo_title: String,
     seo_description: String,
@@ -2979,6 +3004,8 @@ struct PublicSettingsData {
     github_username: Option<String>,
     about_display_name: Option<String>,
     about_bio: Option<String>,
+    about_contacts: Vec<AboutContactRecord>,
+    article_layout: String,
 }
 
 fn read_public_settings_data(
@@ -2987,7 +3014,7 @@ fn read_public_settings_data(
 ) -> Result<PublicSettingsData, ApiError> {
     let row = conn
         .query_opt(
-            "SELECT site_title, site_description, logo_url, footer_text, comment_enabled, seo_title, seo_description, seo_keywords, seo_canonical_url, navigation_items_json::text, footer_links_json::text, standalone_pages_json::text, custom_head_code, custom_footer_code, icp_filing, police_filing, show_filing, github_username, about_display_name, about_bio
+            "SELECT site_title, site_description, logo_url, comment_enabled, seo_title, seo_description, seo_keywords, seo_canonical_url, navigation_items_json::text, footer_links_json::text, standalone_pages_json::text, custom_head_code, custom_footer_code, icp_filing, police_filing, show_filing, github_username, about_display_name, about_bio, about_contacts_json::text, article_layout
              FROM public_site_settings
              WHERE id = $1",
             &[&"default-public-settings"],
@@ -2998,23 +3025,24 @@ fn read_public_settings_data(
     let site_title: String = row.get(0);
     let site_description: String = row.get(1);
     let logo_url: Option<String> = row.get(2);
-    let footer_text: String = row.get(3);
-    let comment_enabled: bool = row.get(4);
-    let seo_title: String = row.get(5);
-    let seo_description: String = row.get(6);
-    let seo_keywords: String = row.get(7);
-    let seo_canonical_url: String = row.get(8);
-    let navigation_items_json: String = row.get(9);
-    let footer_links_json: String = row.get(10);
-    let standalone_pages_json: String = row.get(11);
-    let custom_head_code: Option<String> = row.get(12);
-    let custom_footer_code: Option<String> = row.get(13);
-    let icp_filing: Option<String> = row.get(14);
-    let police_filing: Option<String> = row.get(15);
-    let show_filing: bool = row.get(16);
-    let github_username: Option<String> = row.get(17);
-    let about_display_name: Option<String> = row.get(18);
-    let about_bio: Option<String> = row.get(19);
+    let comment_enabled: bool = row.get(3);
+    let seo_title: String = row.get(4);
+    let seo_description: String = row.get(5);
+    let seo_keywords: String = row.get(6);
+    let seo_canonical_url: String = row.get(7);
+    let navigation_items_json: String = row.get(8);
+    let footer_links_json: String = row.get(9);
+    let standalone_pages_json: String = row.get(10);
+    let custom_head_code: Option<String> = row.get(11);
+    let custom_footer_code: Option<String> = row.get(12);
+    let icp_filing: Option<String> = row.get(13);
+    let police_filing: Option<String> = row.get(14);
+    let show_filing: bool = row.get(15);
+    let github_username: Option<String> = row.get(16);
+    let about_display_name: Option<String> = row.get(17);
+    let about_bio: Option<String> = row.get(18);
+    let about_contacts_json: String = row.get(19);
+    let article_layout: String = row.get(20);
 
     let mut navigation_items = parse_json_records::<NavigationItemRecord>(&navigation_items_json)?;
     navigation_items.sort_by_key(|item| item.sort_order);
@@ -3024,12 +3052,12 @@ fn read_public_settings_data(
 
     let mut standalone_pages = parse_json_records::<StandalonePageRecord>(&standalone_pages_json)?;
     standalone_pages.sort_by_key(|item| item.sort_order);
+    let about_contacts = parse_json_records::<AboutContactRecord>(&about_contacts_json)?;
 
     Ok(PublicSettingsData {
         site_title: site_title.clone(),
         site_description: site_description.clone(),
         logo_url,
-        footer_text,
         comment_enabled,
         seo_title: if seo_title.trim().is_empty() {
             site_title
@@ -3058,6 +3086,8 @@ fn read_public_settings_data(
         github_username,
         about_display_name,
         about_bio,
+        about_contacts,
+        article_layout,
     })
 }
 

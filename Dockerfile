@@ -18,12 +18,16 @@ COPY migrations/ ./migrations/
 RUN if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
       printf '[source.crates-io]\nreplace-with = "mirror"\n[source.mirror]\nregistry = "%s"\n' "$CARGO_REGISTRY_MIRROR" > /usr/local/cargo/config.toml; \
     fi && \
+    HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
     cargo build --release --locked && rm -rf src
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
-RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-recommends \
+RUN HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+    apt-get update -o Acquire::Retries=3 -o Acquire::http::Proxy=false -o Acquire::https::Proxy=false && \
+    HTTP_PROXY= HTTPS_PROXY= http_proxy= https_proxy= ALL_PROXY= all_proxy= NO_PROXY= no_proxy= \
+    apt-get install -y --no-install-recommends \
     ca-certificates libssl3 && \
     rm -rf /var/lib/apt/lists/*
 

@@ -105,6 +105,8 @@ struct FooterLinkRecord {
 struct AboutContactRecord {
     id: String,
     name: String,
+    #[serde(default)]
+    display_text: String,
     url: String,
 }
 
@@ -706,6 +708,7 @@ struct UpdatePublicSiteSettingsInput {
 struct UpdateAboutContactInput {
     id: Option<String>,
     name: String,
+    display_text: Option<String>,
     url: String,
 }
 

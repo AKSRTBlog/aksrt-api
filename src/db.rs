@@ -49,6 +49,35 @@ fn serialize_publication_timestamp(
         .transpose()
 }
 
+fn derive_contact_display_text(url: &str) -> String {
+    let value = url.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("mailto:") {
+        return value["mailto:".len()..].to_string();
+    }
+    if lower.starts_with("tel:") {
+        return value["tel:".len()..].to_string();
+    }
+    if let Some(index) = value.find("://") {
+        let text = &value[index + 3..];
+        return if text.is_empty() {
+            value.to_string()
+        } else {
+            text.to_string()
+        };
+    }
+    if let Some((_, rest)) = value.split_once(':') {
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    value.to_string()
+}
+
 impl<'a> Database<'a> {
     pub(crate) fn new(conn: &'a mut PgClient) -> Self {
         Self { conn }
@@ -791,6 +820,11 @@ impl<'a> Database<'a> {
                     .map(|item| {
                         let name = item.name.trim().to_string();
                         let url = item.url.trim().to_string();
+                        let display_text = item
+                            .display_text
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or_else(|| derive_contact_display_text(&url));
 
                         require_length(
                             &name,
@@ -813,6 +847,13 @@ impl<'a> Database<'a> {
                                 "About contact URL is invalid",
                             ));
                         }
+                        require_length(
+                            &display_text,
+                            1,
+                            120,
+                            "INVALID_ABOUT_CONTACT_DISPLAY_TEXT",
+                            "About contact display text is invalid",
+                        )?;
 
                         let id = item
                             .id
@@ -820,7 +861,12 @@ impl<'a> Database<'a> {
                             .filter(|value| !value.is_empty())
                             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-                        Ok(AboutContactRecord { id, name, url })
+                        Ok(AboutContactRecord {
+                            id,
+                            name,
+                            display_text,
+                            url,
+                        })
                     })
                     .collect::<Result<Vec<_>, ApiError>>()?
             }

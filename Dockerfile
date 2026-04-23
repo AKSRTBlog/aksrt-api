@@ -41,7 +41,6 @@ RUN mkdir -p /app/storage/uploads
 ENV RUST_API_BIND=0.0.0.0:4000
 ENV RUST_API_DATABASE_URL=postgres://postgres:postgres@db:5432/aksrtblog
 ENV RUST_API_UPLOADS_DIR=/app/storage/uploads
-ENV RUST_API_FRONTEND_DIR=
 ENV RUST_API_CORS_ORIGIN=*
 ENV RUST_API_PUBLIC_SITE_URL=http://localhost:3000
 

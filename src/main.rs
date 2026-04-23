@@ -1135,8 +1135,8 @@ async fn main() {
         cors_origin: env::var("RUST_API_CORS_ORIGIN").unwrap_or_else(|_| "*".to_string()),
         public_site_url: env::var("RUST_API_PUBLIC_SITE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
-        frontend_dir: env::var("RUST_API_FRONTEND_DIR")
-            .unwrap_or_else(|_| "frontend/.output/public".to_string()),
+        // API-only by default; set RUST_API_FRONTEND_DIR when backend should serve frontend files.
+        frontend_dir: env::var("RUST_API_FRONTEND_DIR").unwrap_or_default(),
     });
 
     let state = AppState {
@@ -1364,9 +1364,9 @@ async fn main() {
         .route("/sitemap.xml", get(get_sitemap))
         .nest_service("/uploads", ServeDir::new(state.config.uploads_dir.clone()));
 
-    // Only serve frontend static files if FRONTEND_DIR is set
+    // Only serve frontend static files when RUST_API_FRONTEND_DIR is configured.
     let app = if state.config.frontend_dir.is_empty() {
-        println!("Frontend static files disabled (FRONTEND_DIR is empty)");
+        println!("Frontend static files disabled (API-only mode)");
         app.fallback(|| async { (
             StatusCode::NOT_FOUND,
             axum::Json(ApiEnvelope::<()>::error("NOT_FOUND", "Frontend not served by API")),

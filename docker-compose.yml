@@ -34,7 +34,6 @@ services:
       # 支持外部数据库：优先使用外部地址，否则使用 docker-compose 内部网络
       RUST_API_DATABASE_URL: ${EXTERNAL_DB_URL:-postgres://${DB_USER:-postgres}:${DB_PASSWORD:-changeme}@db:${DB_PORT:-5432}/${DB_NAME:-aksrtblog}}
       RUST_API_UPLOADS_DIR: /app/storage/uploads
-      RUST_API_FRONTEND_DIR:
       RUST_API_CORS_ORIGIN: ${CORS_ORIGIN:-*}
       RUST_API_PUBLIC_SITE_URL: ${SITE_URL:-http://localhost:3000}
     volumes:

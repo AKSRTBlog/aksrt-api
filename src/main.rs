@@ -2435,6 +2435,28 @@ fn load_public_admin_avatar_url(conn: &mut PgClient) -> Result<Option<String>, A
     Ok(Some(cravatar_url_with_size(trimmed_email, 256)))
 }
 
+fn load_public_admin_author_name(conn: &mut PgClient) -> Result<Option<String>, ApiError> {
+    let row = conn
+        .query_opt(
+            "SELECT display_name, username
+             FROM admins
+             WHERE status = 'active'
+             ORDER BY created_at ASC
+             LIMIT 1",
+            &[],
+        )
+        .map_err(db_error)?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let display_name: String = row.get(0);
+    let username: String = row.get(1);
+
+    Ok(normalize_optional_text(Some(display_name)).or_else(|| normalize_optional_text(Some(username))))
+}
+
 fn load_admin_session_by_id(
     conn: &mut PgClient,
     session_id: &str,
@@ -2959,6 +2981,7 @@ fn read_public_site_settings(
 ) -> Result<PublicSiteSettingsItem, ApiError> {
     let settings = read_public_settings_data(conn, fallback_site_url)?;
     let admin_avatar_url = load_public_admin_avatar_url(conn)?;
+    let admin_author_name = load_public_admin_author_name(conn)?;
 
     let mut navigation_items = settings
         .navigation_items
@@ -3009,7 +3032,7 @@ fn read_public_site_settings(
         police_filing: settings.police_filing,
         show_filing: settings.show_filing,
         github_username: settings.github_username,
-        about_display_name: settings.about_display_name,
+        about_display_name: admin_author_name,
         about_bio: settings.about_bio,
         about_contacts: settings.about_contacts,
         admin_avatar_url,

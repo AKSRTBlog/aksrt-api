@@ -872,6 +872,11 @@ impl<'a> Database<'a> {
             Some(value) => normalize_optional_text(value),
             None => current.about_bio.clone(),
         };
+        let article_layout = input
+            .article_layout
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.article_layout.clone());
         let about_contacts = match input.about_contacts {
             Some(items) => {
                 if items.len() > 20 {
@@ -984,14 +989,21 @@ impl<'a> Database<'a> {
                 "About bio is invalid",
             )?;
         }
+        if !matches!(article_layout.as_str(), "list" | "grid") {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_ARTICLE_LAYOUT",
+                "Article layout must be list or grid",
+            ));
+        }
 
         self.conn
             .execute(
                 "UPDATE public_site_settings
                  SET site_title = $1, site_description = $2, logo_url = $3, comment_enabled = $4,
                      seo_title = $5, seo_description = $6, seo_keywords = $7, custom_head_code = $8, custom_footer_code = $9, icp_filing = $10, police_filing = $11,
-                     show_filing = $12, github_username = $13, about_display_name = $14, about_bio = $15, about_contacts_json = $16::jsonb, updated_at = NOW()
-                 WHERE id = $17",
+                     show_filing = $12, github_username = $13, about_display_name = $14, about_bio = $15, about_contacts_json = $16::jsonb, article_layout = $17, updated_at = NOW()
+                 WHERE id = $18",
                 &[
                     &site_title,
                     &site_description,
@@ -1009,6 +1021,7 @@ impl<'a> Database<'a> {
                     &about_display_name,
                     &about_bio,
                     &about_contacts_json,
+                    &article_layout,
                     &"default-public-settings",
                 ],
             )

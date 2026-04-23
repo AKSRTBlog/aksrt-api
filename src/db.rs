@@ -1,4 +1,4 @@
-use std::env;
+use std::{collections::HashSet, env};
 
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
@@ -76,6 +76,73 @@ fn derive_contact_display_text(url: &str) -> String {
         }
     }
     value.to_string()
+}
+
+fn build_excerpt_from_markdown(markdown: &str, max_chars: usize) -> String {
+    let mut merged = String::new();
+    let mut in_fence = false;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if !merged.is_empty() {
+            merged.push(' ');
+        }
+        merged.push_str(line);
+    }
+
+    let mut cleaned = String::with_capacity(merged.len());
+    let mut in_inline_code = false;
+
+    for ch in merged.chars() {
+        if ch == '`' {
+            in_inline_code = !in_inline_code;
+            continue;
+        }
+        if in_inline_code {
+            continue;
+        }
+
+        match ch {
+            '#' | '>' | '*' | '_' | '[' | ']' | '(' | ')' | '!' | '-' | '|' => cleaned.push(' '),
+            '\r' | '\n' | '\t' => cleaned.push(' '),
+            _ => cleaned.push(ch),
+        }
+    }
+
+    let normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let fallback = markdown.split_whitespace().collect::<Vec<_>>().join(" ");
+    let source = if normalized.is_empty() {
+        fallback
+    } else {
+        normalized
+    };
+
+    source.chars().take(max_chars).collect()
+}
+
+fn parse_numeric_slug(value: &str) -> Option<i64> {
+    value.parse::<i64>().ok().or_else(|| {
+        value.strip_prefix("page-")
+            .and_then(|suffix| suffix.parse::<i64>().ok())
+    })
+}
+
+fn generate_next_numeric_slug(used_slugs: &mut HashSet<String>, next_value: &mut i64) -> String {
+    loop {
+        let current = (*next_value).max(1);
+        *next_value = current + 1;
+        let candidate = current.to_string();
+        if used_slugs.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
 }
 
 impl<'a> Database<'a> {
@@ -1076,19 +1143,59 @@ impl<'a> Database<'a> {
             ));
         }
 
+        let mut provided_slugs = HashSet::new();
+        let mut max_numeric_slug = 0_i64;
+        for item in &input.items {
+            let slug = item.slug.as_deref().unwrap_or_default().trim();
+            if slug.is_empty() {
+                continue;
+            }
+
+            if !is_valid_slug(slug) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_STANDALONE_PAGE",
+                    "Standalone page is invalid",
+                ));
+            }
+            if !provided_slugs.insert(slug.to_string()) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_STANDALONE_PAGE",
+                    "Standalone page slug is duplicated",
+                ));
+            }
+
+            if let Some(value) = parse_numeric_slug(slug) {
+                max_numeric_slug = max_numeric_slug.max(value);
+            }
+        }
+
+        let mut used_slugs = provided_slugs;
+        let mut next_slug_value = max_numeric_slug + 1;
+
         let items = input
             .items
             .into_iter()
             .map(|item| {
                 let title = item.title.trim().to_string();
-                let slug = item.slug.trim().to_string();
-                let summary = item.summary.trim().to_string();
+                let raw_slug = item.slug.unwrap_or_default();
+                let raw_slug = raw_slug.trim();
+                let slug = if raw_slug.is_empty() {
+                    generate_next_numeric_slug(&mut used_slugs, &mut next_slug_value)
+                } else {
+                    raw_slug.to_string()
+                };
                 let content = item.content.trim().to_string();
+                let input_summary = item.summary.unwrap_or_default().trim().to_string();
+                let summary = if input_summary.is_empty() {
+                    build_excerpt_from_markdown(&content, 150)
+                } else {
+                    input_summary
+                };
 
                 if title.is_empty()
-                    || summary.is_empty()
                     || content.is_empty()
-                    || !is_valid_slug(&slug)
                 {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,

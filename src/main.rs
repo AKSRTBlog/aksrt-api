@@ -757,8 +757,8 @@ struct UpdateStandalonePagesEnvelope {
 struct UpdateStandalonePageInput {
     id: Option<String>,
     title: String,
-    slug: String,
-    summary: String,
+    slug: Option<String>,
+    summary: Option<String>,
     content: String,
     sort_order: i64,
     enabled: bool,
@@ -5008,14 +5008,16 @@ fn generate_next_article_slug(conn: &mut PgClient) -> Result<String, ApiError> {
     let next = rows
         .into_iter()
         .filter_map(|slug| {
-            slug.strip_prefix("article-")
-                .and_then(|value| value.parse::<i64>().ok())
+            slug.parse::<i64>().ok().or_else(|| {
+                slug.strip_prefix("article-")
+                    .and_then(|value| value.parse::<i64>().ok())
+            })
         })
         .max()
         .unwrap_or(0)
         + 1;
 
-    Ok(format!("article-{}", next))
+    Ok(next.to_string())
 }
 
 fn resolve_publication(

@@ -700,7 +700,6 @@ struct UpdatePublicSiteSettingsInput {
     about_display_name: Option<Option<String>>,
     about_bio: Option<Option<String>>,
     about_contacts: Option<Vec<UpdateAboutContactInput>>,
-    article_layout: Option<String>,
 }
 
 #[derive(Deserialize)]

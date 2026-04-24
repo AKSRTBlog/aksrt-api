@@ -150,7 +150,8 @@ fn resolve_article_excerpt(excerpt: Option<String>, content: &str) -> String {
 
 fn parse_numeric_slug(value: &str) -> Option<i64> {
     value.parse::<i64>().ok().or_else(|| {
-        value.strip_prefix("page-")
+        value
+            .strip_prefix("page-")
             .and_then(|suffix| suffix.parse::<i64>().ok())
     })
 }
@@ -200,11 +201,7 @@ impl<'a> Database<'a> {
                      WHERE article_id = $1
                        AND LOWER(email) = LOWER($2)
                        AND created_at >= NOW() - ($3::TEXT || ' seconds')::INTERVAL",
-                    &[
-                        &article_id,
-                        &email,
-                        &min_interval_seconds.to_string(),
-                    ],
+                    &[&article_id, &email, &min_interval_seconds.to_string()],
                 )
                 .map_err(db_error)?
                 .get(0);
@@ -227,11 +224,7 @@ impl<'a> Database<'a> {
                      WHERE article_id = $1
                        AND created_at >= NOW() - ($2::TEXT || ' minutes')::INTERVAL
                        AND LOWER(email) = LOWER($3)",
-                    &[
-                        &article_id,
-                        &per_article_window_minutes.to_string(),
-                        &email,
-                    ],
+                    &[&article_id, &per_article_window_minutes.to_string(), &email],
                 )
                 .map_err(db_error)?
                 .get(0);
@@ -1255,13 +1248,7 @@ impl<'a> Database<'a> {
             )?;
         }
         if let Some(bio) = about_bio.as_ref() {
-            require_length(
-                bio,
-                1,
-                1000,
-                "INVALID_ABOUT_BIO",
-                "About bio is invalid",
-            )?;
+            require_length(bio, 1, 1000, "INVALID_ABOUT_BIO", "About bio is invalid")?;
         }
 
         self.conn
@@ -1473,9 +1460,7 @@ impl<'a> Database<'a> {
                     input_summary
                 };
 
-                if title.is_empty()
-                    || content.is_empty()
-                {
+                if title.is_empty() || content.is_empty() {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         "INVALID_STANDALONE_PAGE",
@@ -1751,6 +1736,9 @@ impl<'a> Database<'a> {
         } else {
             public_site_url.to_string()
         };
+        if akismet_enabled {
+            verify_akismet_api_key(&akismet_api_key, &safe_site_url)?;
+        }
 
         self.conn
             .execute(
@@ -1801,6 +1789,25 @@ impl<'a> Database<'a> {
         comment_id: &str,
         outcome: CommentModerationOutcome,
     ) -> Result<MutationResult, ApiError> {
+        let should_discard = outcome
+            .akismet_result
+            .as_ref()
+            .map(|result| result.discard)
+            .unwrap_or(false);
+        if should_discard {
+            self.conn
+                .execute(
+                    "DELETE FROM comments WHERE id = $1 AND status = 'pending'",
+                    &[&comment_id],
+                )
+                .map_err(db_error)?;
+
+            return Ok(MutationResult {
+                id: comment_id.to_string(),
+                status: "rejected".to_string(),
+            });
+        }
+
         let reviewed_by = if outcome.status == "pending" {
             None
         } else {
@@ -2679,10 +2686,7 @@ impl<'a> Database<'a> {
                     "Project payload is invalid",
                 ));
             };
-            if title.is_empty()
-                || description.is_empty()
-                || !validate_url(&link)
-                || sort_order < 0
+            if title.is_empty() || description.is_empty() || !validate_url(&link) || sort_order < 0
             {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
@@ -2861,10 +2865,7 @@ impl<'a> Database<'a> {
             .filter(|value| !value.is_empty())
             .unwrap_or(current.password.clone());
 
-        if host.is_empty()
-            || from_name.is_empty()
-            || !validate_email(&from_email)
-        {
+        if host.is_empty() || from_name.is_empty() || !validate_email(&from_email) {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "INVALID_SMTP_CONFIG",

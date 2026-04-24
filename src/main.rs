@@ -1,10 +1,5 @@
 use std::{
-    collections::HashMap,
-    env,
-    error::Error as StdError,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
+    collections::HashMap, env, error::Error as StdError, net::SocketAddr, path::PathBuf, sync::Arc,
     time::Duration as StdDuration,
 };
 
@@ -472,8 +467,8 @@ struct MutationResult {
 struct PublicCommentSubmissionResult {
     id: String,
     status: String,
-    unlock_token: String,
-    unlock_token_expires_at: String,
+    unlock_token: Option<String>,
+    unlock_token_expires_at: Option<String>,
     post_id: String,
 }
 
@@ -989,6 +984,8 @@ struct CommentModerationAkismetResult {
     attempted: bool,
     is_spam: bool,
     discard: bool,
+    error: bool,
+    recheck_after: Option<String>,
     score: i32,
     note: String,
 }
@@ -1377,8 +1374,9 @@ async fn main() {
 
     let config = Arc::new(Config {
         bind: env::var("RUST_API_BIND").unwrap_or_else(|_| "0.0.0.0:4000".to_string()),
-        database_url: env::var("RUST_API_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:5432/aksrtblog".to_string()),
+        database_url: env::var("RUST_API_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://postgres:postgres@127.0.0.1:5432/aksrtblog".to_string()
+        }),
         uploads_dir: env::var("RUST_API_UPLOADS_DIR")
             .unwrap_or_else(|_| "storage/uploads".to_string()),
         cors_origin: env::var("RUST_API_CORS_ORIGIN").unwrap_or_else(|_| "*".to_string()),
@@ -1620,15 +1618,24 @@ async fn main() {
     // Only serve frontend static files when RUST_API_FRONTEND_DIR is configured.
     let app = if state.config.frontend_dir.is_empty() {
         println!("Frontend static files disabled (API-only mode)");
-        app.fallback(|| async { (
-            StatusCode::NOT_FOUND,
-            axum::Json(ApiEnvelope::<()>::error("NOT_FOUND", "Frontend not served by API")),
-        )})
+        app.fallback(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(ApiEnvelope::<()>::error(
+                    "NOT_FOUND",
+                    "Frontend not served by API",
+                )),
+            )
+        })
     } else {
         println!("Serving frontend from: {}", state.config.frontend_dir);
-        app.nest_service("/", ServeDir::new(state.config.frontend_dir.clone()).fallback(
-            ServeFile::new(format!("{}/index.html", state.config.frontend_dir)),
-        ))
+        app.nest_service(
+            "/",
+            ServeDir::new(state.config.frontend_dir.clone()).fallback(ServeFile::new(format!(
+                "{}/index.html",
+                state.config.frontend_dir
+            ))),
+        )
     };
 
     let app = app
@@ -1643,9 +1650,12 @@ async fn main() {
         .await
         .expect("failed to bind listener");
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .expect("server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("server error");
 }
 
 async fn health() -> impl IntoResponse {
@@ -1734,7 +1744,9 @@ fn format_database_startup_error(database_url: &str, error: &postgres::Error) ->
             " Hint: the password portion of the URL contains `#`. PostgreSQL URLs require reserved characters in passwords to be percent-encoded, so replace `#` with `%23`.",
         );
     }
-    if formatted_error.contains("28P01") || formatted_error.contains("password authentication failed") {
+    if formatted_error.contains("28P01")
+        || formatted_error.contains("password authentication failed")
+    {
         message.push_str(
             " Hint: check the username/password in RUST_API_DATABASE_URL, or align it with DB_PASSWORD when using docker compose.",
         );
@@ -1938,7 +1950,10 @@ fn build_access_token(admin_id: &str, session_id: &str, expires_at: i64) -> Stri
 }
 
 fn build_comment_unlock_token(article_id: &str, comment_id: &str, expires_at: i64) -> String {
-    let signature_input = format!("comment-unlock|{}|{}|{}", article_id, comment_id, expires_at);
+    let signature_input = format!(
+        "comment-unlock|{}|{}|{}",
+        article_id, comment_id, expires_at
+    );
     let mut mac =
         Hmac::<Sha256>::new_from_slice(access_secret().as_bytes()).expect("invalid access secret");
     mac.update(signature_input.as_bytes());
@@ -2135,9 +2150,15 @@ fn detect_comment_browser_label(user_agent: Option<&str>) -> String {
                 .or_else(|| extract_user_agent_version(user_agent, "Opera/")),
         )
     } else if lower.contains("firefox/") {
-        ("Firefox", extract_user_agent_version(user_agent, "Firefox/"))
+        (
+            "Firefox",
+            extract_user_agent_version(user_agent, "Firefox/"),
+        )
     } else if lower.contains("crios/") {
-        ("Chrome iOS", extract_user_agent_version(user_agent, "CriOS/"))
+        (
+            "Chrome iOS",
+            extract_user_agent_version(user_agent, "CriOS/"),
+        )
     } else if lower.contains("chrome/") || lower.contains("chromium/") {
         (
             "Chrome",
@@ -2205,7 +2226,6 @@ fn detect_comment_os_label(user_agent: Option<&str>) -> String {
     }
 }
 
-
 fn hex_lower(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -2245,11 +2265,7 @@ fn hmac_sha1_base64(key: &[u8], value: &str) -> String {
 }
 
 fn storage_config_error(message: impl Into<String>) -> ApiError {
-    ApiError::new(
-        StatusCode::BAD_REQUEST,
-        "INVALID_STORAGE_CONFIG",
-        message,
-    )
+    ApiError::new(StatusCode::BAD_REQUEST, "INVALID_STORAGE_CONFIG", message)
 }
 
 fn storage_request_error(
@@ -2399,8 +2415,7 @@ fn write_local_storage_file(
     object_key: &str,
     bytes: &[u8],
 ) -> Result<(), ApiError> {
-    let target_path =
-        std::path::Path::new(uploads_dir).join(object_key.replace('/', "\\"));
+    let target_path = std::path::Path::new(uploads_dir).join(object_key.replace('/', "\\"));
 
     if let Some(parent) = target_path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
@@ -2424,8 +2439,7 @@ fn write_local_storage_file(
 }
 
 fn delete_local_storage_file(uploads_dir: &str, object_key: &str) {
-    let target_path =
-        std::path::Path::new(uploads_dir).join(object_key.replace('/', "\\"));
+    let target_path = std::path::Path::new(uploads_dir).join(object_key.replace('/', "\\"));
     let _ = std::fs::remove_file(target_path);
 }
 
@@ -2445,9 +2459,8 @@ fn upload_to_s3_compatible_storage(
     let now = Utc::now();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date_stamp = now.format("%Y%m%d").to_string();
-    let canonical_headers = format!(
-        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-    );
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
     let canonical_request = format!(
         "PUT\n{}\n\n{}{}\n{}",
@@ -2481,7 +2494,11 @@ fn upload_to_s3_compatible_storage(
         .body(bytes.to_vec())
         .send()
         .map_err(|error| {
-            ApiError::new(StatusCode::BAD_GATEWAY, "MEDIA_UPLOAD_FAILED", error.to_string())
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "MEDIA_UPLOAD_FAILED",
+                error.to_string(),
+            )
         })?;
 
     if !response.status().is_success() {
@@ -2512,9 +2529,8 @@ fn delete_from_s3_compatible_storage(
     let now = Utc::now();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
     let date_stamp = now.format("%Y%m%d").to_string();
-    let canonical_headers = format!(
-        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-    );
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
     let canonical_request = format!(
         "DELETE\n{}\n\n{}{}\n{}",
@@ -2546,7 +2562,11 @@ fn delete_from_s3_compatible_storage(
         .header("x-amz-date", amz_date)
         .send()
         .map_err(|error| {
-            ApiError::new(StatusCode::BAD_GATEWAY, "MEDIA_DELETE_FAILED", error.to_string())
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "MEDIA_DELETE_FAILED",
+                error.to_string(),
+            )
         })?;
 
     if !(response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND) {
@@ -2591,7 +2611,11 @@ fn upload_to_aliyun_oss(
         .body(bytes.to_vec())
         .send()
         .map_err(|error| {
-            ApiError::new(StatusCode::BAD_GATEWAY, "MEDIA_UPLOAD_FAILED", error.to_string())
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "MEDIA_UPLOAD_FAILED",
+                error.to_string(),
+            )
         })?;
 
     if !response.status().is_success() {
@@ -2632,7 +2656,11 @@ fn delete_from_aliyun_oss(
         .header("Date", date)
         .send()
         .map_err(|error| {
-            ApiError::new(StatusCode::BAD_GATEWAY, "MEDIA_DELETE_FAILED", error.to_string())
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "MEDIA_DELETE_FAILED",
+                error.to_string(),
+            )
         })?;
 
     if !(response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND) {
@@ -2697,7 +2725,11 @@ fn upload_to_tencent_cos(
         .body(bytes.to_vec())
         .send()
         .map_err(|error| {
-            ApiError::new(StatusCode::BAD_GATEWAY, "MEDIA_UPLOAD_FAILED", error.to_string())
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "MEDIA_UPLOAD_FAILED",
+                error.to_string(),
+            )
         })?;
 
     if !response.status().is_success() {
@@ -2727,7 +2759,11 @@ fn delete_from_tencent_cos(
         .header("Authorization", authorization)
         .send()
         .map_err(|error| {
-            ApiError::new(StatusCode::BAD_GATEWAY, "MEDIA_DELETE_FAILED", error.to_string())
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "MEDIA_DELETE_FAILED",
+                error.to_string(),
+            )
         })?;
 
     if !(response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND) {
@@ -2757,8 +2793,12 @@ fn upload_media_to_storage(
         "s3-compatible" => {
             upload_to_s3_compatible_storage(storage, bucket_override, object_key, mime_type, bytes)
         }
-        "aliyun-oss" => upload_to_aliyun_oss(storage, bucket_override, object_key, mime_type, bytes),
-        "tencent-cos" => upload_to_tencent_cos(storage, bucket_override, object_key, mime_type, bytes),
+        "aliyun-oss" => {
+            upload_to_aliyun_oss(storage, bucket_override, object_key, mime_type, bytes)
+        }
+        "tencent-cos" => {
+            upload_to_tencent_cos(storage, bucket_override, object_key, mime_type, bytes)
+        }
         _ => Err(storage_config_error("Unsupported storage driver")),
     }
 }
@@ -2809,7 +2849,10 @@ fn open_connection(state: &AppState) -> Result<PgClient, ApiError> {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "DATABASE_OPEN_FAILED",
-            format!("Failed to open PostgreSQL database: {}", format_postgres_error(&error)),
+            format!(
+                "Failed to open PostgreSQL database: {}",
+                format_postgres_error(&error)
+            ),
         )
     })
 }
@@ -2936,7 +2979,8 @@ fn load_public_admin_author_name(conn: &mut PgClient) -> Result<Option<String>, 
     let display_name: String = row.get(0);
     let username: String = row.get(1);
 
-    Ok(normalize_optional_text(Some(display_name)).or_else(|| normalize_optional_text(Some(username))))
+    Ok(normalize_optional_text(Some(display_name))
+        .or_else(|| normalize_optional_text(Some(username))))
 }
 
 fn load_admin_session_by_id(
@@ -3065,7 +3109,10 @@ fn parse_comment_unlock_token(token: &str) -> Result<(String, String, i64), ApiE
     })?;
     let signature = parts[5];
 
-    let signature_input = format!("comment-unlock|{}|{}|{}", article_id, comment_id, expires_at);
+    let signature_input = format!(
+        "comment-unlock|{}|{}|{}",
+        article_id, comment_id, expires_at
+    );
     let mut mac =
         Hmac::<Sha256>::new_from_slice(access_secret().as_bytes()).expect("invalid access secret");
     mac.update(signature_input.as_bytes());
@@ -3175,10 +3222,7 @@ fn cravatar_url(email: &str) -> String {
 fn cravatar_url_with_size(email: &str, size: u32) -> String {
     let normalized = email.trim().to_lowercase();
     let hash = format!("{:x}", md5::compute(normalized.as_bytes()));
-    format!(
-        "https://cravatar.cn/avatar/{}?s={}&d=identicon",
-        hash, size
-    )
+    format!("https://cravatar.cn/avatar/{}?s={}&d=identicon", hash, size)
 }
 
 async fn get_public_site_settings(
@@ -3597,13 +3641,14 @@ fn validate_geetest_captcha(
         ));
     }
 
-    let mut mac = Hmac::<Sha256>::new_from_slice(config.captcha_key.as_bytes()).map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "CAPTCHA_VALIDATION_ERROR",
-            format!("Failed to initialize captcha signing: {error}"),
-        )
-    })?;
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(config.captcha_key.as_bytes()).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "CAPTCHA_VALIDATION_ERROR",
+                format!("Failed to initialize captcha signing: {error}"),
+            )
+        })?;
     mac.update(captcha.lot_number.as_bytes());
     let sign_token = hex_lower(&mac.finalize().into_bytes());
 
@@ -3630,7 +3675,10 @@ fn validate_geetest_captcha(
         return Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "CAPTCHA_VALIDATION_ERROR",
-            format!("Captcha validation service returned HTTP {}", response.status()),
+            format!(
+                "Captcha validation service returned HTTP {}",
+                response.status()
+            ),
         ));
     }
 
@@ -3714,48 +3762,63 @@ fn count_comment_links(content: &str) -> usize {
         .sum()
 }
 
-fn run_akismet_comment_check(
-    config: &InternalCommentModerationConfig,
+fn akismet_http_client() -> Result<HttpClient, String> {
+    HttpClient::builder()
+        .timeout(StdDuration::from_secs(4))
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn akismet_required_meta_error(field: &str) -> CommentModerationAkismetResult {
+    CommentModerationAkismetResult {
+        enabled: true,
+        attempted: false,
+        is_spam: false,
+        discard: false,
+        error: true,
+        recheck_after: None,
+        score: 40,
+        note: format!("Akismet skipped because required {field} is missing."),
+    }
+}
+
+fn akismet_response_header(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(200).collect::<String>())
+}
+
+fn akismet_comment_form(
+    api_key: &str,
+    blog: &str,
     article: &ArticleRow,
     input: &CreateCommentInput,
     client_meta: &CommentClientMeta,
     public_site_url: &str,
-) -> CommentModerationAkismetResult {
-    if !config.akismet_enabled {
-        return CommentModerationAkismetResult {
-            enabled: false,
-            attempted: false,
-            is_spam: false,
-            discard: false,
-            score: 0,
-            note: "Akismet check disabled.".to_string(),
-        };
-    }
-
-    let api_key = config.akismet_api_key.trim();
-    if api_key.is_empty() {
-        return CommentModerationAkismetResult {
-            enabled: true,
-            attempted: false,
-            is_spam: false,
-            discard: false,
-            score: 0,
-            note: "Akismet API key missing.".to_string(),
-        };
-    }
-
-    let blog = if validate_url(config.akismet_site_url.trim()) {
-        config.akismet_site_url.trim().to_string()
-    } else {
-        public_site_url.to_string()
-    };
+) -> Result<Vec<(&'static str, String)>, CommentModerationAkismetResult> {
+    let user_ip = client_meta
+        .ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| akismet_required_meta_error("user_ip"))?;
+    let user_agent = client_meta
+        .user_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| akismet_required_meta_error("user_agent"))?;
     let permalink = site_url(public_site_url, &format!("/articles/{}", article.slug));
-    let endpoint = format!("https://{}.rest.akismet.com/1.1/comment-check", api_key);
-
     let mut form = vec![
-        ("blog", blog),
-        ("blog_lang", config.akismet_blog_lang.trim().to_string()),
+        ("api_key", api_key.to_string()),
+        ("blog", blog.to_string()),
+        ("blog_lang", "zh-CN".to_string()),
         ("blog_charset", "UTF-8".to_string()),
+        ("user_ip", user_ip.to_string()),
+        ("user_agent", user_agent.to_string()),
         ("comment_type", "comment".to_string()),
         ("comment_author", input.nickname.trim().to_string()),
         ("comment_author_email", input.email.trim().to_string()),
@@ -3769,25 +3832,123 @@ fn run_akismet_comment_check(
         ("comment_post_modified_gmt", article.updated_at.clone()),
     ];
 
-    if let Some(value) = client_meta.ip.as_deref() {
-        if !value.trim().is_empty() {
-            form.push(("user_ip", value.trim().to_string()));
-        }
-    }
-
-    if let Some(value) = client_meta.user_agent.as_deref() {
-        if !value.trim().is_empty() {
-            form.push(("user_agent", value.trim().to_string()));
-        }
-    }
-
     if let Some(value) = client_meta.referrer.as_deref() {
         if !value.trim().is_empty() {
             form.push(("referrer", value.trim().to_string()));
         }
     }
 
-    let client = match HttpClient::builder().timeout(StdDuration::from_secs(4)).build() {
+    Ok(form)
+}
+
+fn verify_akismet_api_key(api_key: &str, blog: &str) -> Result<(), ApiError> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "AKISMET_KEY_MISSING",
+            "Akismet API key is required when Akismet is enabled",
+        ));
+    }
+
+    let client = akismet_http_client().map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "AKISMET_CLIENT_FAILED",
+            format!("Akismet client init failed: {error}"),
+        )
+    })?;
+    let form = vec![("key", api_key.to_string()), ("blog", blog.to_string())];
+    let response = client
+        .post("https://rest.akismet.com/1.1/verify-key")
+        .header("User-Agent", "AKSRTBlog/1.0 | Akismet/1.1")
+        .form(&form)
+        .send()
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "AKISMET_VERIFY_FAILED",
+                format!("Akismet key verification request failed: {error}"),
+            )
+        })?;
+    let status = response.status();
+    let debug_help = akismet_response_header(response.headers(), "x-akismet-debug-help");
+    let body = response.text().map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "AKISMET_VERIFY_FAILED",
+            format!("Akismet key verification response failed: {error}"),
+        )
+    })?;
+    if status.is_success() && body.trim().eq_ignore_ascii_case("valid") {
+        return Ok(());
+    }
+
+    let suffix = debug_help
+        .map(|value| format!(" ({value})"))
+        .unwrap_or_default();
+    Err(ApiError::new(
+        StatusCode::BAD_REQUEST,
+        "AKISMET_KEY_INVALID",
+        format!(
+            "Akismet API key verification failed: {}{}",
+            body.trim(),
+            suffix
+        ),
+    ))
+}
+
+fn run_akismet_comment_check(
+    config: &InternalCommentModerationConfig,
+    article: &ArticleRow,
+    input: &CreateCommentInput,
+    client_meta: &CommentClientMeta,
+    public_site_url: &str,
+) -> CommentModerationAkismetResult {
+    if !config.akismet_enabled {
+        return CommentModerationAkismetResult {
+            enabled: false,
+            attempted: false,
+            is_spam: false,
+            discard: false,
+            error: false,
+            recheck_after: None,
+            score: 0,
+            note: "Akismet check disabled.".to_string(),
+        };
+    }
+
+    let api_key = config.akismet_api_key.trim();
+    if api_key.is_empty() {
+        return CommentModerationAkismetResult {
+            enabled: true,
+            attempted: false,
+            is_spam: false,
+            discard: false,
+            error: true,
+            recheck_after: None,
+            score: 40,
+            note: "Akismet API key missing.".to_string(),
+        };
+    }
+
+    let blog = if validate_url(config.akismet_site_url.trim()) {
+        config.akismet_site_url.trim().to_string()
+    } else {
+        public_site_url.to_string()
+    };
+    let mut form =
+        match akismet_comment_form(api_key, &blog, article, input, client_meta, public_site_url) {
+            Ok(form) => form,
+            Err(result) => return result,
+        };
+    if !config.akismet_blog_lang.trim().is_empty() {
+        if let Some((_, value)) = form.iter_mut().find(|(name, _)| *name == "blog_lang") {
+            *value = config.akismet_blog_lang.trim().to_string();
+        }
+    }
+
+    let client = match akismet_http_client() {
         Ok(client) => client,
         Err(error) => {
             return CommentModerationAkismetResult {
@@ -3795,31 +3956,84 @@ fn run_akismet_comment_check(
                 attempted: false,
                 is_spam: false,
                 discard: false,
-                score: 15,
+                error: true,
+                recheck_after: None,
+                score: 40,
                 note: format!("Akismet client init failed: {error}"),
             };
         }
     };
 
     match client
-        .post(endpoint)
+        .post("https://rest.akismet.com/1.1/comment-check")
         .header("User-Agent", "AKSRTBlog/1.0 | Akismet/1.1")
         .form(&form)
         .send()
     {
         Ok(response) => {
+            let status = response.status();
             let discard = response
                 .headers()
                 .get("x-akismet-pro-tip")
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.eq_ignore_ascii_case("discard"))
                 .unwrap_or(false);
+            let debug_help = akismet_response_header(response.headers(), "x-akismet-debug-help");
+            let recheck_after =
+                akismet_response_header(response.headers(), "x-akismet-recheck-after");
 
             match response.text() {
                 Ok(body) => {
-                    let is_spam = body.trim().eq_ignore_ascii_case("true");
+                    let body = body.trim();
+                    if !status.is_success() {
+                        return CommentModerationAkismetResult {
+                            enabled: true,
+                            attempted: true,
+                            is_spam: false,
+                            discard: false,
+                            error: true,
+                            recheck_after,
+                            score: 40,
+                            note: format!(
+                                "Akismet request returned HTTP {}: {}{}",
+                                status.as_u16(),
+                                body,
+                                debug_help
+                                    .map(|value| format!(" ({value})"))
+                                    .unwrap_or_default()
+                            ),
+                        };
+                    }
+
+                    if !body.eq_ignore_ascii_case("true") && !body.eq_ignore_ascii_case("false") {
+                        return CommentModerationAkismetResult {
+                            enabled: true,
+                            attempted: true,
+                            is_spam: false,
+                            discard: false,
+                            error: true,
+                            recheck_after,
+                            score: 40,
+                            note: format!(
+                                "Akismet returned an unexpected response: {}{}",
+                                body,
+                                debug_help
+                                    .map(|value| format!(" ({value})"))
+                                    .unwrap_or_default()
+                            ),
+                        };
+                    }
+
+                    let is_spam = body.eq_ignore_ascii_case("true");
+                    let should_recheck = recheck_after.is_some();
                     let score = if is_spam {
-                        if discard { 95 } else { 75 }
+                        if discard {
+                            95
+                        } else {
+                            75
+                        }
+                    } else if should_recheck {
+                        40
                     } else {
                         0
                     };
@@ -3828,9 +4042,16 @@ fn run_akismet_comment_check(
                         attempted: true,
                         is_spam,
                         discard,
+                        error: false,
+                        recheck_after,
                         score,
-                        note: if is_spam {
+                        note: if discard {
+                            "Akismet marked this comment as spam and recommended discard."
+                                .to_string()
+                        } else if is_spam {
                             "Akismet marked this comment as spam.".to_string()
+                        } else if should_recheck {
+                            "Akismet passed but requested a later recheck.".to_string()
                         } else {
                             "Akismet passed.".to_string()
                         },
@@ -3841,7 +4062,9 @@ fn run_akismet_comment_check(
                     attempted: true,
                     is_spam: false,
                     discard: false,
-                    score: 20,
+                    error: true,
+                    recheck_after: None,
+                    score: 40,
                     note: format!("Akismet response parse failed: {error}"),
                 },
             }
@@ -3851,9 +4074,103 @@ fn run_akismet_comment_check(
             attempted: true,
             is_spam: false,
             discard: false,
-            score: 20,
+            error: true,
+            recheck_after: None,
+            score: 40,
             note: format!("Akismet request failed: {error}"),
         },
+    }
+}
+
+fn submit_akismet_comment_feedback(
+    config: &InternalCommentModerationConfig,
+    comment: &AdminCommentItem,
+    public_site_url: &str,
+    spam: bool,
+) -> Result<(), String> {
+    if !config.enabled || !config.akismet_enabled {
+        return Ok(());
+    }
+
+    let api_key = config.akismet_api_key.trim();
+    if api_key.is_empty() {
+        return Ok(());
+    }
+
+    let user_ip = comment
+        .ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Akismet feedback skipped because user_ip is missing.".to_string())?;
+    let user_agent = comment
+        .user_agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Akismet feedback skipped because user_agent is missing.".to_string())?;
+    let blog = if validate_url(config.akismet_site_url.trim()) {
+        config.akismet_site_url.trim().to_string()
+    } else {
+        public_site_url.to_string()
+    };
+    let permalink = site_url(
+        public_site_url,
+        &format!("/articles/{}", comment.article.slug),
+    );
+    let form = vec![
+        ("api_key", api_key.to_string()),
+        ("blog", blog),
+        ("blog_charset", "UTF-8".to_string()),
+        ("user_ip", user_ip.to_string()),
+        ("user_agent", user_agent.to_string()),
+        ("comment_type", "comment".to_string()),
+        ("comment_author", comment.nickname.trim().to_string()),
+        ("comment_author_email", comment.email.trim().to_string()),
+        (
+            "comment_author_url",
+            comment
+                .website
+                .clone()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        ),
+        ("comment_content", comment.content.trim().to_string()),
+        ("permalink", permalink),
+    ];
+    let endpoint = if spam {
+        "https://rest.akismet.com/1.1/submit-spam"
+    } else {
+        "https://rest.akismet.com/1.1/submit-ham"
+    };
+    let response = akismet_http_client()?
+        .post(endpoint)
+        .header("User-Agent", "AKSRTBlog/1.0 | Akismet/1.1")
+        .form(&form)
+        .send()
+        .map_err(|error| format!("Akismet feedback request failed: {error}"))?;
+    let status = response.status();
+    let debug_help = akismet_response_header(response.headers(), "x-akismet-debug-help");
+    let body = response
+        .text()
+        .map_err(|error| format!("Akismet feedback response failed: {error}"))?;
+
+    if status.is_success()
+        && body
+            .trim()
+            .eq_ignore_ascii_case("Thanks for making the web a better place.")
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "Akismet feedback returned HTTP {}: {}{}",
+            status.as_u16(),
+            body.trim(),
+            debug_help
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default()
+        ))
     }
 }
 
@@ -3914,7 +4231,10 @@ fn run_ai_comment_moderation(
         input.content.trim()
     );
 
-    let client = match HttpClient::builder().timeout(StdDuration::from_secs(6)).build() {
+    let client = match HttpClient::builder()
+        .timeout(StdDuration::from_secs(6))
+        .build()
+    {
         Ok(client) => client,
         Err(error) => {
             return CommentModerationAiResult {
@@ -4073,6 +4393,9 @@ fn evaluate_comment_moderation(
 
     let akismet_result =
         run_akismet_comment_check(config, article, input, client_meta, public_site_url);
+    let akismet_needs_manual_review =
+        akismet_result.enabled && (akismet_result.error || akismet_result.recheck_after.is_some());
+    let akismet_requested_discard = akismet_result.enabled && akismet_result.discard;
     if akismet_result.enabled {
         score += akismet_result.score;
         reasons.push(akismet_result.note.clone());
@@ -4095,19 +4418,23 @@ fn evaluate_comment_moderation(
 
     let status = match risk_level {
         "high" if config.auto_reject_high_risk => "rejected".to_string(),
-        "low" if config.auto_approve_low_risk => "approved".to_string(),
+        "low" if config.auto_approve_low_risk && !akismet_needs_manual_review => {
+            "approved".to_string()
+        }
         _ => "pending".to_string(),
     };
     let reject_reason = if status == "rejected" {
-        Some("Rejected by automated moderation pipeline.".to_string())
+        if akismet_requested_discard {
+            Some("Discarded by Akismet automated moderation.".to_string())
+        } else {
+            Some("Rejected by automated moderation pipeline.".to_string())
+        }
     } else {
         None
     };
 
     let summary = if reasons.is_empty() {
-        format!(
-            "Risk score {score} ({risk_level}), auto decision: {status}.",
-        )
+        format!("Risk score {score} ({risk_level}), auto decision: {status}.",)
     } else {
         format!(
             "Risk score {score} ({risk_level}), auto decision: {status}. Signals: {}",
@@ -4132,64 +4459,6 @@ fn evaluate_comment_moderation(
             None
         },
     }
-}
-
-fn spawn_comment_moderation_task(
-    database_url: String,
-    public_site_url: String,
-    comment_id: String,
-    article: ArticleRow,
-    input: CreateCommentInput,
-    client_meta: CommentClientMeta,
-    notification: PendingCommentNotification,
-) {
-    tokio::spawn(async move {
-        let comment_id_for_log = comment_id.clone();
-        let task_result = tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-            let mut conn = PgClient::connect(&database_url, NoTls).map_err(db_error)?;
-            let moderation_config =
-                read_internal_comment_moderation_config(&mut conn, &public_site_url)?;
-            let moderation = evaluate_comment_moderation(
-                &moderation_config,
-                &article,
-                &input,
-                &client_meta,
-                &public_site_url,
-            );
-            let final_result =
-                Database::new(&mut conn).apply_comment_moderation_outcome(&comment_id, moderation)?;
-
-            if final_result.status == "pending" {
-                let mut notification = notification;
-                notification.status = final_result.status;
-                try_send_pending_comment_notification(
-                    &mut conn,
-                    &public_site_url,
-                    &article,
-                    &notification,
-                );
-            }
-
-            Ok(())
-        })
-        .await;
-
-        match task_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!(
-                    "Async comment moderation failed for comment {}: [{}] {}",
-                    comment_id_for_log, error.code, error.message
-                );
-            }
-            Err(error) => {
-                eprintln!(
-                    "Async comment moderation task failed for comment {}: {}",
-                    comment_id_for_log, error
-                );
-            }
-        }
-    });
 }
 
 fn preview_captcha_value(value: &str) -> String {
@@ -4668,7 +4937,13 @@ fn send_notification_emails(
 
     for to_email in recipient_emails {
         if !to_email.trim().is_empty() {
-            let _ = send_smtp_email(config, to_email.trim(), subject, text_body.clone(), html_body.clone());
+            let _ = send_smtp_email(
+                config,
+                to_email.trim(),
+                subject,
+                text_body.clone(),
+                html_body.clone(),
+            );
         }
     }
 
@@ -4701,7 +4976,12 @@ fn try_send_pending_comment_notification(
     let reply_html = notification
         .parent_id
         .as_deref()
-        .map(|value| format!("<p><strong>Reply to comment:</strong> {}</p>", escape_html(value)))
+        .map(|value| {
+            format!(
+                "<p><strong>Reply to comment:</strong> {}</p>",
+                escape_html(value)
+            )
+        })
         .unwrap_or_default();
 
     let text_body = format!(
@@ -4868,7 +5148,10 @@ fn try_send_comment_review_notification(
         _ => return,
     };
 
-    let article_url = site_url(public_site_url, &format!("/articles/{}", comment.article.slug));
+    let article_url = site_url(
+        public_site_url,
+        &format!("/articles/{}", comment.article.slug),
+    );
     let reject_line = comment
         .reject_reason
         .as_deref()
@@ -5111,8 +5394,6 @@ async fn submit_public_comment(
     headers: HeaderMap,
     Json(input): Json<CreateCommentInput>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let public_site_url = state.config.public_site_url.clone();
-    let database_url = state.config.database_url.clone();
     let client_meta = extract_comment_client_meta(&headers, Some(peer_addr));
     let input_for_moderation = input.clone();
     let client_meta_for_moderation = client_meta.clone();
@@ -5140,36 +5421,52 @@ async fn submit_public_comment(
             client_meta.ip.clone(),
             client_meta.user_agent.clone(),
         )?;
+        let moderation = evaluate_comment_moderation(
+            &moderation_config,
+            &article,
+            &input_for_moderation,
+            &client_meta_for_moderation,
+            &state.config.public_site_url,
+        );
+        let final_result =
+            Database::new(&mut conn).apply_comment_moderation_outcome(&created.id, moderation)?;
 
-        Ok((created, article, notification))
+        if final_result.status == "pending" {
+            let mut notification = notification.clone();
+            notification.status = final_result.status.clone();
+            try_send_pending_comment_notification(
+                &mut conn,
+                &state.config.public_site_url,
+                &article,
+                &notification,
+            );
+        }
+
+        Ok((final_result, article))
     })
     .await?;
 
-    let (comment_result, article, notification) = &result;
+    let (comment_result, article) = &result;
     let article = article.clone();
-    let unlock_expires_at = Utc::now() + Duration::seconds(comment_unlock_ttl_seconds());
-    let unlock_token = build_comment_unlock_token(
-        &article.id,
-        &comment_result.id,
-        unlock_expires_at.timestamp(),
-    );
-    let article_for_notification = article.clone();
-    let notification = notification.clone();
-    spawn_comment_moderation_task(
-        database_url,
-        public_site_url,
-        comment_result.id.clone(),
-        article_for_notification,
-        input_for_moderation,
-        client_meta_for_moderation,
-        notification,
-    );
+    let (unlock_token, unlock_token_expires_at) = if comment_result.status == "approved" {
+        let expires_at = Utc::now() + Duration::seconds(comment_unlock_ttl_seconds());
+        (
+            Some(build_comment_unlock_token(
+                &article.id,
+                &comment_result.id,
+                expires_at.timestamp(),
+            )),
+            Some(expires_at.to_rfc3339()),
+        )
+    } else {
+        (None, None)
+    };
 
     Ok(created(PublicCommentSubmissionResult {
         id: comment_result.id.clone(),
         status: comment_result.status.clone(),
         unlock_token,
-        unlock_token_expires_at: unlock_expires_at.to_rfc3339(),
+        unlock_token_expires_at,
         post_id: article.id.clone(),
     }))
 }
@@ -5195,7 +5492,8 @@ async fn submit_public_friend_link_application(
             status: "pending".to_string(),
         };
         let (ip, user_agent) = extract_client_meta(&headers);
-        let result = Database::new(&mut conn).create_friend_link_application(input, ip, user_agent)?;
+        let result =
+            Database::new(&mut conn).create_friend_link_application(input, ip, user_agent)?;
         Ok((result, notification))
     })
     .await?;
@@ -5330,7 +5628,9 @@ fn read_public_sync_version(conn: &mut PgClient) -> Result<String, ApiError> {
     Ok(version)
 }
 
-async fn get_public_sync_version(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+async fn get_public_sync_version(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, ApiError> {
     run_blocking(move || {
         let mut conn = open_connection(&state)?;
         Ok(ok(PublicSyncVersionItem {
@@ -5856,10 +6156,11 @@ async fn admin_update_comment_moderation_config(
     run_blocking(move || {
         let _auth = require_admin_auth(&state, &headers)?;
         let mut conn = open_connection(&state)?;
-        Ok(ok(Database::new(&mut conn).update_comment_moderation_config(
-            &public_site_url,
-            input,
-        )?))
+        Ok(ok(Database::new(&mut conn)
+            .update_comment_moderation_config(
+                &public_site_url,
+                input,
+            )?))
     })
     .await
 }
@@ -6147,11 +6448,7 @@ async fn admin_review_comment(
     let result = run_blocking(move || {
         let auth = require_admin_auth(&state, &headers)?;
         let mut conn = open_connection(&state)?;
-        let result = Database::new(&mut conn).review_comment(
-            &id,
-            input,
-            &auth.admin.id,
-        )?;
+        let result = Database::new(&mut conn).review_comment(&id, input, &auth.admin.id)?;
         Ok(result)
     })
     .await?;
@@ -6161,6 +6458,26 @@ async fn admin_review_comment(
     tokio::spawn(async move {
         tokio::task::spawn_blocking(move || {
             if let Ok(mut conn) = PgClient::connect(&database_url, NoTls) {
+                if matches!(comment.status.as_str(), "approved" | "rejected") {
+                    match read_internal_comment_moderation_config(&mut conn, &public_site_url_clone)
+                        .map_err(|error| error.message)
+                        .and_then(|config| {
+                            submit_akismet_comment_feedback(
+                                &config,
+                                &comment,
+                                &public_site_url_clone,
+                                comment.status == "rejected",
+                            )
+                        }) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "Failed to submit Akismet feedback for comment {}: {}",
+                                comment.id, error
+                            );
+                        }
+                    }
+                }
                 try_send_comment_review_notification(&mut conn, &public_site_url_clone, &comment);
             }
         })
@@ -6300,13 +6617,12 @@ async fn admin_review_friend_link_application(
     let result = run_blocking(move || {
         let auth = require_admin_auth(&state, &headers)?;
         let mut conn = open_connection(&state)?;
-        let result = Database::new(&mut conn)
-            .review_friend_link_application(
-                &id,
-                input,
-                &auth.admin.id,
-                &public_site_url_for_closure,
-            )?;
+        let result = Database::new(&mut conn).review_friend_link_application(
+            &id,
+            input,
+            &auth.admin.id,
+            &public_site_url_for_closure,
+        )?;
         Ok(result)
     })
     .await?;
@@ -7462,7 +7778,10 @@ async fn admin_delete_media(
     })
     .await
     {
-        eprintln!("Failed to delete media object from storage: {}", error.message);
+        eprintln!(
+            "Failed to delete media object from storage: {}",
+            error.message
+        );
     }
 
     {
@@ -7974,9 +8293,7 @@ fn table_has_created_at(conn: &mut PgClient, table: &str) -> Result<bool, ApiErr
         table
     );
 
-    let row = conn
-        .query_one(&sql, &[])
-        .map_err(db_error)?;
+    let row = conn.query_one(&sql, &[]).map_err(db_error)?;
 
     Ok(row.get(0))
 }
@@ -8099,7 +8416,8 @@ mod tests {
 
     #[test]
     fn split_comment_locked_markdown_separates_public_and_hidden_sections() {
-        let markdown = "before\n<!-- comment-lock:start -->\nhidden\n<!-- comment-lock:end -->\nafter";
+        let markdown =
+            "before\n<!-- comment-lock:start -->\nhidden\n<!-- comment-lock:end -->\nafter";
         let protected = split_comment_locked_markdown(markdown);
 
         assert_eq!(protected.public_content, "before\nafter");
@@ -8123,7 +8441,8 @@ mod tests {
 
     #[test]
     fn build_article_content_view_hides_locked_content_until_unlock() {
-        let markdown = "intro\n<!-- comment-lock:start -->\nsecret\n<!-- comment-lock:end -->\noutro";
+        let markdown =
+            "intro\n<!-- comment-lock:start -->\nsecret\n<!-- comment-lock:end -->\noutro";
 
         let locked = build_article_content_view(markdown, false);
         assert_eq!(locked.0, "intro\noutro");
@@ -8150,5 +8469,4 @@ mod tests {
         assert_eq!(parsed.1, "comment-2");
         assert_eq!(parsed.2, expires_at);
     }
-
 }

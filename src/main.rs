@@ -13,6 +13,7 @@ use chrono::{Datelike, Duration, NaiveDate, Utc};
 use dotenvy::dotenv;
 use hmac::{Hmac, KeyInit, Mac};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header as JwtHeader, Validation};
+use jsonwebtoken::errors::ErrorKind as JwtErrorKind;
 use lettre::{
     message::{header::ContentType, Mailbox, MultiPart, SinglePart},
     transport::smtp::{
@@ -1668,30 +1669,37 @@ fn has_comment_unlock_access(
     headers: &HeaderMap,
     secret: &str,
     post_id: &str,
-) -> bool {
+) -> Result<bool, ApiError> {
     let Some(authorization) = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
     else {
-        return false;
+        return Ok(false);
     };
 
     let Some(token) = authorization.strip_prefix("Bearer ").map(str::trim) else {
-        return false;
+        return Ok(false);
     };
 
     if token.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     let validation = Validation::default();
-    decode::<CommentUnlockClaims>(
+    match decode::<CommentUnlockClaims>(
         token,
         &DecodingKey::from_secret(secret.as_bytes()),
         &validation,
     )
-    .map(|data| data.claims.post_id == post_id)
-    .unwrap_or(false)
+    {
+        Ok(data) => Ok(data.claims.post_id == post_id),
+        Err(error) if matches!(error.kind(), JwtErrorKind::ExpiredSignature) => Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "COMMENT_UNLOCK_TOKEN_EXPIRED",
+            "Comment unlock credential has expired",
+        )),
+        Err(_) => Ok(false),
+    }
 }
 
 fn escape_html(value: &str) -> String {
@@ -3971,7 +3979,7 @@ async fn get_public_article(
             })?;
 
         let unlocked =
-            has_comment_unlock_access(&headers, &state.config.comment_unlock_jwt_secret, &article.id);
+            has_comment_unlock_access(&headers, &state.config.comment_unlock_jwt_secret, &article.id)?;
         Ok(ok(build_article_detail(&mut conn, article, unlocked)?))
     })
     .await

@@ -6,6 +6,11 @@ use uuid::Uuid;
 
 use crate::*;
 
+const COMMENT_PER_ARTICLE_LIMIT_WINDOW_MINUTES: i64 = 10;
+const COMMENT_PER_ARTICLE_LIMIT_MAX: i64 = 1;
+const COMMENT_GLOBAL_LIMIT_WINDOW_MINUTES: i64 = 60;
+const COMMENT_GLOBAL_LIMIT_MAX: i64 = 6;
+
 pub(crate) struct Database<'a> {
     conn: &'a mut PgClient,
 }
@@ -148,6 +153,71 @@ fn generate_next_numeric_slug(used_slugs: &mut HashSet<String>, next_value: &mut
 impl<'a> Database<'a> {
     pub(crate) fn new(conn: &'a mut PgClient) -> Self {
         Self { conn }
+    }
+
+    fn enforce_public_comment_rate_limit(
+        &mut self,
+        article_id: &str,
+        email: &str,
+        ip: Option<&str>,
+    ) -> Result<(), ApiError> {
+        let recent_article_comments: i64 = self
+            .conn
+            .query_one(
+                "SELECT COUNT(*)::BIGINT
+                 FROM comments
+                 WHERE article_id = $1
+                   AND created_at >= NOW() - ($2::TEXT || ' minutes')::INTERVAL
+                   AND (
+                     LOWER(email) = LOWER($3)
+                     OR ($4::TEXT IS NOT NULL AND ip = $4)
+                   )",
+                &[
+                    &article_id,
+                    &COMMENT_PER_ARTICLE_LIMIT_WINDOW_MINUTES.to_string(),
+                    &email,
+                    &ip,
+                ],
+            )
+            .map_err(db_error)?
+            .get(0);
+
+        if recent_article_comments >= COMMENT_PER_ARTICLE_LIMIT_MAX {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "COMMENT_RATE_LIMITED",
+                "You are commenting too frequently on this article. Please try again later.",
+            ));
+        }
+
+        let recent_global_comments: i64 = self
+            .conn
+            .query_one(
+                "SELECT COUNT(*)::BIGINT
+                 FROM comments
+                 WHERE created_at >= NOW() - ($1::TEXT || ' minutes')::INTERVAL
+                   AND (
+                     LOWER(email) = LOWER($2)
+                     OR ($3::TEXT IS NOT NULL AND ip = $3)
+                   )",
+                &[
+                    &COMMENT_GLOBAL_LIMIT_WINDOW_MINUTES.to_string(),
+                    &email,
+                    &ip,
+                ],
+            )
+            .map_err(db_error)?
+            .get(0);
+
+        if recent_global_comments >= COMMENT_GLOBAL_LIMIT_MAX {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "COMMENT_RATE_LIMITED",
+                "Too many comment attempts detected. Please try again later.",
+            ));
+        }
+
+        Ok(())
     }
 
     pub(crate) fn ensure_default_records(&mut self, config: &Config) -> Result<(), ApiError> {
@@ -641,6 +711,8 @@ impl<'a> Database<'a> {
                 "Email format is invalid",
             ));
         }
+
+        self.enforce_public_comment_rate_limit(article_id, &email, ip.as_deref())?;
 
         if let Some(website) = website.as_ref() {
             require_length(

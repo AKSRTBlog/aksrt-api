@@ -24,15 +24,16 @@ services:
   # Rust API 服务
   api:
     build: .
-    image: lexo0522/aksrtblog-api:latest
+    image: kate522/aksrtblog-api:latest
     container_name: aksrtblog-api
     restart: unless-stopped
     ports:
       - "4000:4000"
     environment:
       RUST_API_BIND: 0.0.0.0:4000
-      # 支持外部数据库：优先使用外部地址，否则使用 docker-compose 内部网络
-      RUST_API_DATABASE_URL: ${EXTERNAL_DB_URL:-postgres://${DB_USER:-postgres}:${DB_PASSWORD:-changeme}@db:${DB_PORT:-5432}/${DB_NAME:-aksrtblog}}
+      # Use the container-network port for the bundled db service. DB_PORT is only
+      # the host-published port and may differ in production.
+      RUST_API_DATABASE_URL: ${EXTERNAL_DB_URL:-postgres://${DB_USER:-postgres}:${DB_PASSWORD:-changeme}@db:5432/${DB_NAME:-aksrtblog}}
       RUST_API_UPLOADS_DIR: /app/storage/uploads
       RUST_API_CORS_ORIGIN: ${CORS_ORIGIN:-*}
       RUST_API_PUBLIC_SITE_URL: ${SITE_URL:-http://localhost:3000}

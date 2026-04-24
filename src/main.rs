@@ -1,4 +1,12 @@
-use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration as StdDuration};
+use std::{
+    collections::HashMap,
+    env,
+    error::Error as StdError,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration as StdDuration,
+};
 
 use axum::{
     body::Body,
@@ -316,7 +324,9 @@ struct PublicCommentItem {
     avatar_url: String,
     content: String,
     ip: Option<String>,
+    user_agent: Option<String>,
     browser_label: String,
+    os_label: String,
     created_at: String,
     replies: Vec<PublicCommentItem>,
 }
@@ -1715,15 +1725,54 @@ fn load_environment() {
 }
 
 fn format_database_startup_error(database_url: &str, error: &postgres::Error) -> String {
-    let mut message = format!("Failed to connect PostgreSQL using RUST_API_DATABASE_URL: {error}");
+    let formatted_error = format_postgres_error(error);
+    let mut message =
+        format!("Failed to connect PostgreSQL using RUST_API_DATABASE_URL: {formatted_error}");
 
     if has_unescaped_hash_in_database_password(database_url) {
         message.push_str(
             " Hint: the password portion of the URL contains `#`. PostgreSQL URLs require reserved characters in passwords to be percent-encoded, so replace `#` with `%23`.",
         );
     }
+    if formatted_error.contains("28P01") || formatted_error.contains("password authentication failed") {
+        message.push_str(
+            " Hint: check the username/password in RUST_API_DATABASE_URL, or align it with DB_PASSWORD when using docker compose.",
+        );
+    }
+    if formatted_error.contains("database") && formatted_error.contains("does not exist") {
+        message.push_str(
+            " Hint: create the target database first or use docker compose so the configured database is initialized automatically.",
+        );
+    }
 
     message
+}
+
+fn format_postgres_error(error: &postgres::Error) -> String {
+    let mut parts = vec![error.to_string()];
+
+    if let Some(db_error) = error.as_db_error() {
+        parts.push(format!("SQLSTATE {}", db_error.code().code()));
+        parts.push(format!("message: {}", db_error.message()));
+
+        if let Some(detail) = db_error.detail() {
+            parts.push(format!("detail: {detail}"));
+        }
+        if let Some(hint) = db_error.hint() {
+            parts.push(format!("hint: {hint}"));
+        }
+    }
+
+    let mut source = StdError::source(error);
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !cause_text.is_empty() && !parts.iter().any(|part| part == &cause_text) {
+            parts.push(cause_text);
+        }
+        source = cause.source();
+    }
+
+    parts.join("; ")
 }
 
 fn has_unescaped_hash_in_database_password(database_url: &str) -> bool {
@@ -2106,6 +2155,53 @@ fn detect_comment_browser_label(user_agent: Option<&str>) -> String {
     match browser.1 {
         Some(version) if !version.is_empty() => format!("{} {}", browser.0, version),
         _ => browser.0.to_string(),
+    }
+}
+
+fn extract_user_agent_os_version(user_agent: &str, token: &str) -> Option<String> {
+    let start = user_agent.find(token)? + token.len();
+    let version = user_agent[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '_' || *ch == '.')
+        .collect::<String>()
+        .replace('_', ".");
+
+    if version.is_empty() {
+        None
+    } else {
+        Some(version)
+    }
+}
+
+fn detect_comment_os_label(user_agent: Option<&str>) -> String {
+    let Some(user_agent) = user_agent.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "Unknown OS".to_string();
+    };
+
+    let lower = user_agent.to_ascii_lowercase();
+    if lower.contains("windows nt") {
+        "Windows".to_string()
+    } else if lower.contains("iphone") || lower.contains("ipad") || lower.contains("ipod") {
+        match extract_user_agent_os_version(user_agent, "OS ") {
+            Some(version) => format!("iOS {}", version),
+            None => "iOS".to_string(),
+        }
+    } else if lower.contains("android") {
+        match extract_user_agent_os_version(user_agent, "Android ") {
+            Some(version) => format!("Android {}", version),
+            None => "Android".to_string(),
+        }
+    } else if lower.contains("mac os x") {
+        match extract_user_agent_os_version(user_agent, "Mac OS X ") {
+            Some(version) => format!("macOS {}", version),
+            None => "macOS".to_string(),
+        }
+    } else if lower.contains("cros") {
+        "ChromeOS".to_string()
+    } else if lower.contains("linux") {
+        "Linux".to_string()
+    } else {
+        "Unknown OS".to_string()
     }
 }
 
@@ -2713,7 +2809,7 @@ fn open_connection(state: &AppState) -> Result<PgClient, ApiError> {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "DATABASE_OPEN_FAILED",
-            format!("Failed to open PostgreSQL database: {}", error),
+            format!("Failed to open PostgreSQL database: {}", format_postgres_error(&error)),
         )
     })
 }
@@ -2722,7 +2818,7 @@ fn db_error(error: postgres::Error) -> ApiError {
     ApiError::new(
         StatusCode::INTERNAL_SERVER_ERROR,
         "DATABASE_QUERY_FAILED",
-        error.to_string(),
+        format_postgres_error(&error),
     )
 }
 
@@ -7761,7 +7857,9 @@ fn load_public_comments(
                 avatar_url: cravatar_url(&comment.email),
                 content: comment.content.clone(),
                 ip: comment.ip.clone(),
+                user_agent: comment.user_agent.clone(),
                 browser_label: detect_comment_browser_label(comment.user_agent.as_deref()),
+                os_label: detect_comment_os_label(comment.user_agent.as_deref()),
                 created_at: comment.created_at.clone(),
                 replies: Vec::new(),
             },

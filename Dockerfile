@@ -38,6 +38,8 @@ RUN --mount=type=cache,id=aksrtblog-cargo-registry,target=/usr/local/cargo/regis
     mkdir -p src && \
     printf 'fn main() {}\n' > src/main.rs && \
     cargo build --release --locked --offline --verbose && \
+    rm -f target/release/aksrtblog-rust-api target/release/aksrtblog-rust-api.d && \
+    rm -rf target/release/deps/aksrtblog_rust_api* target/release/.fingerprint/aksrtblog-rust-api-* && \
     rm -rf src
 
 COPY src/ ./src/
@@ -48,9 +50,14 @@ RUN --mount=type=cache,id=aksrtblog-cargo-registry,target=/usr/local/cargo/regis
     --mount=type=cache,id=aksrtblog-target-linux-amd64,target=/app/target,sharing=locked \
     unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy; \
     set -eux; \
+    find src -type f -exec touch {} +; \
+    rm -f target/release/aksrtblog-rust-api target/release/aksrtblog-rust-api.d; \
+    rm -rf target/release/deps/aksrtblog_rust_api* target/release/.fingerprint/aksrtblog-rust-api-*; \
     cargo build --release --locked --offline --verbose && \
     mkdir -p /app/bin && \
-    cp /app/target/release/aksrtblog-rust-api /app/bin/aksrtblog-rust-api
+    cp /app/target/release/aksrtblog-rust-api /app/bin/aksrtblog-rust-api && \
+    test -s /app/bin/aksrtblog-rust-api && \
+    grep -a "Rust API listening" /app/bin/aksrtblog-rust-api >/dev/null
 
 # Stage 2: Runtime
 FROM ${RUNTIME_IMAGE}

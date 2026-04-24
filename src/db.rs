@@ -84,10 +84,11 @@ fn derive_contact_display_text(url: &str) -> String {
 }
 
 fn build_excerpt_from_markdown(markdown: &str, max_chars: usize) -> String {
+    let visible_markdown = strip_comment_locked_markdown(markdown);
     let mut merged = String::new();
     let mut in_fence = false;
 
-    for line in markdown.lines() {
+    for line in visible_markdown.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
             in_fence = !in_fence;
@@ -122,7 +123,10 @@ fn build_excerpt_from_markdown(markdown: &str, max_chars: usize) -> String {
     }
 
     let normalized = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let fallback = markdown.split_whitespace().collect::<Vec<_>>().join(" ");
+    let fallback = visible_markdown
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let source = if normalized.is_empty() {
         fallback
     } else {
@@ -130,6 +134,15 @@ fn build_excerpt_from_markdown(markdown: &str, max_chars: usize) -> String {
     };
 
     source.chars().take(max_chars).collect()
+}
+
+fn resolve_article_excerpt(excerpt: Option<String>, content: &str) -> String {
+    let provided = excerpt.unwrap_or_default().trim().to_string();
+    if !provided.is_empty() {
+        return provided;
+    }
+
+    build_excerpt_from_markdown(content, 150)
 }
 
 fn parse_numeric_slug(value: &str) -> Option<i64> {
@@ -224,6 +237,7 @@ impl<'a> Database<'a> {
         self.ensure_media_asset_schema()?;
         self.ensure_page_view_schema()?;
         self.ensure_public_site_settings_schema()?;
+        self.ensure_comment_moderation_schema()?;
 
         let admin_exists = self
             .conn
@@ -439,6 +453,35 @@ impl<'a> Database<'a> {
                 .map_err(db_error)?;
         }
 
+        let comment_moderation_exists = self
+            .conn
+            .query_opt(
+                "SELECT id FROM comment_moderation_configs WHERE id = $1",
+                &[&"default-comment-moderation"],
+            )
+            .map_err(db_error)?
+            .is_some();
+        if !comment_moderation_exists {
+            self.conn
+                .execute(
+                    "INSERT INTO comment_moderation_configs (
+                        id, enabled, akismet_enabled, akismet_api_key, akismet_site_url, akismet_blog_lang,
+                        ai_enabled, ai_provider, ai_api_key, ai_model,
+                        auto_approve_low_risk, auto_reject_high_risk,
+                        low_risk_max_score, high_risk_min_score, blocked_keywords_json,
+                        created_at, updated_at
+                     ) VALUES (
+                        $1, TRUE, FALSE, '', $2, 'zh-CN',
+                        FALSE, 'openai', '', 'omni-moderation-latest',
+                        TRUE, TRUE,
+                        35, 80, '[]'::jsonb,
+                        NOW(), NOW()
+                     )",
+                    &[&"default-comment-moderation", &config.public_site_url],
+                )
+                .map_err(db_error)?;
+        }
+
         let category_count = self
             .conn
             .query_one("SELECT COUNT(*) FROM article_categories", &[])
@@ -534,6 +577,42 @@ impl<'a> Database<'a> {
                     ADD COLUMN IF NOT EXISTS about_bio TEXT,
                     ADD COLUMN IF NOT EXISTS about_contacts_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                     ADD COLUMN IF NOT EXISTS article_layout TEXT NOT NULL DEFAULT 'list';",
+            )
+            .map_err(db_error)?;
+
+        Ok(())
+    }
+
+    fn ensure_comment_moderation_schema(&mut self) -> Result<(), ApiError> {
+        self.conn
+            .batch_execute(
+                "CREATE TABLE IF NOT EXISTS comment_moderation_configs (
+                    id TEXT PRIMARY KEY,
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    akismet_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    akismet_api_key TEXT NOT NULL DEFAULT '',
+                    akismet_site_url TEXT NOT NULL DEFAULT '',
+                    akismet_blog_lang TEXT NOT NULL DEFAULT 'zh-CN',
+                    ai_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    ai_provider TEXT NOT NULL DEFAULT 'openai',
+                    ai_api_key TEXT NOT NULL DEFAULT '',
+                    ai_model TEXT NOT NULL DEFAULT 'omni-moderation-latest',
+                    auto_approve_low_risk BOOLEAN NOT NULL DEFAULT TRUE,
+                    auto_reject_high_risk BOOLEAN NOT NULL DEFAULT TRUE,
+                    low_risk_max_score INTEGER NOT NULL DEFAULT 35,
+                    high_risk_min_score INTEGER NOT NULL DEFAULT 80,
+                    blocked_keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                ALTER TABLE comments
+                    ADD COLUMN IF NOT EXISTS moderation_risk_level TEXT,
+                    ADD COLUMN IF NOT EXISTS moderation_risk_score INTEGER,
+                    ADD COLUMN IF NOT EXISTS moderation_summary TEXT,
+                    ADD COLUMN IF NOT EXISTS moderation_akismet_json JSONB,
+                    ADD COLUMN IF NOT EXISTS moderation_ai_json JSONB,
+                    ADD COLUMN IF NOT EXISTS moderation_pipeline_version TEXT;",
             )
             .map_err(db_error)?;
 
@@ -1431,6 +1510,183 @@ impl<'a> Database<'a> {
         })
     }
 
+    pub(crate) fn update_comment_moderation_config(
+        &mut self,
+        public_site_url: &str,
+        input: UpdateCommentModerationConfigInput,
+    ) -> Result<CommentModerationAdminConfigItem, ApiError> {
+        let current = read_internal_comment_moderation_config(self.conn, public_site_url)?;
+
+        let enabled = input.enabled.unwrap_or(current.enabled);
+        let akismet_enabled = input.akismet_enabled.unwrap_or(current.akismet_enabled);
+        let akismet_api_key = input
+            .akismet_api_key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.akismet_api_key);
+        let akismet_site_url = input
+            .akismet_site_url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.akismet_site_url);
+        let akismet_blog_lang = input
+            .akismet_blog_lang
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.akismet_blog_lang);
+
+        let ai_enabled = input.ai_enabled.unwrap_or(current.ai_enabled);
+        let ai_provider = input
+            .ai_provider
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.ai_provider);
+        let ai_api_key = input
+            .ai_api_key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.ai_api_key);
+        let ai_model = input
+            .ai_model
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.ai_model);
+
+        let auto_approve_low_risk = input
+            .auto_approve_low_risk
+            .unwrap_or(current.auto_approve_low_risk);
+        let auto_reject_high_risk = input
+            .auto_reject_high_risk
+            .unwrap_or(current.auto_reject_high_risk);
+        let low_risk_max_score = input
+            .low_risk_max_score
+            .unwrap_or(current.low_risk_max_score);
+        let high_risk_min_score = input
+            .high_risk_min_score
+            .unwrap_or(current.high_risk_min_score);
+        let blocked_keywords = input
+            .blocked_keywords
+            .map(normalize_comment_blocked_keywords)
+            .unwrap_or(current.blocked_keywords);
+
+        let (low_risk_max_score, high_risk_min_score) =
+            normalize_comment_moderation_thresholds(low_risk_max_score, high_risk_min_score);
+        let blocked_keywords_json = serialize_json_value(&blocked_keywords)?;
+        let safe_provider = if ai_provider == "openai" {
+            ai_provider
+        } else {
+            "openai".to_string()
+        };
+        let safe_site_url = if validate_url(&akismet_site_url) {
+            akismet_site_url
+        } else {
+            public_site_url.to_string()
+        };
+
+        self.conn
+            .execute(
+                "UPDATE comment_moderation_configs
+                 SET enabled = $1, akismet_enabled = $2, akismet_api_key = $3, akismet_site_url = $4, akismet_blog_lang = $5,
+                     ai_enabled = $6, ai_provider = $7, ai_api_key = $8, ai_model = $9,
+                     auto_approve_low_risk = $10, auto_reject_high_risk = $11,
+                     low_risk_max_score = $12, high_risk_min_score = $13, blocked_keywords_json = $14::jsonb,
+                     updated_at = NOW()
+                 WHERE id = $15",
+                &[
+                    &enabled,
+                    &akismet_enabled,
+                    &akismet_api_key,
+                    &safe_site_url,
+                    &akismet_blog_lang,
+                    &ai_enabled,
+                    &safe_provider,
+                    &ai_api_key,
+                    &ai_model,
+                    &auto_approve_low_risk,
+                    &auto_reject_high_risk,
+                    &low_risk_max_score,
+                    &high_risk_min_score,
+                    &blocked_keywords_json,
+                    &"default-comment-moderation",
+                ],
+            )
+            .map_err(db_error)?;
+
+        let updated = read_internal_comment_moderation_config(self.conn, public_site_url)?;
+        Ok(to_comment_moderation_admin_config_item(updated))
+    }
+
+    pub(crate) fn apply_comment_moderation_outcome(
+        &mut self,
+        comment_id: &str,
+        outcome: CommentModerationOutcome,
+    ) -> Result<MutationResult, ApiError> {
+        let reviewed_by = if outcome.status == "pending" {
+            None
+        } else {
+            Some("system-moderation".to_string())
+        };
+        let reject_reason = if outcome.status == "rejected" {
+            normalize_optional_text(outcome.reject_reason)
+        } else {
+            None
+        };
+        let akismet_json = outcome
+            .akismet_result
+            .as_ref()
+            .map(serialize_json_value)
+            .transpose()?;
+        let ai_json = outcome
+            .ai_result
+            .as_ref()
+            .map(serialize_json_value)
+            .transpose()?;
+
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE comments
+                 SET status = $1,
+                     reviewed_by = CASE WHEN $1 = 'pending' THEN NULL ELSE $2 END,
+                     reviewed_at = CASE WHEN $1 = 'pending' THEN NULL ELSE NOW() END,
+                     reject_reason = $3,
+                     moderation_risk_level = $4,
+                     moderation_risk_score = $5,
+                     moderation_summary = $6,
+                     moderation_akismet_json = $7::jsonb,
+                     moderation_ai_json = $8::jsonb,
+                     moderation_pipeline_version = $9,
+                     updated_at = NOW()
+                 WHERE id = $10",
+                &[
+                    &outcome.status,
+                    &reviewed_by,
+                    &reject_reason,
+                    &outcome.risk_level,
+                    &outcome.risk_score,
+                    &outcome.summary,
+                    &akismet_json,
+                    &ai_json,
+                    &COMMENT_MODERATION_PIPELINE_VERSION,
+                    &comment_id,
+                ],
+            )
+            .map_err(db_error)?;
+
+        if updated == 0 {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "COMMENT_NOT_FOUND",
+                "Comment was not found",
+            ));
+        }
+
+        Ok(MutationResult {
+            id: comment_id.to_string(),
+            status: outcome.status,
+        })
+    }
+
     pub(crate) fn review_comment(
         &mut self,
         comment_id: &str,
@@ -1807,8 +2063,8 @@ impl<'a> Database<'a> {
         admin_id: &str,
     ) -> Result<ArticleDetailItem, ApiError> {
         let title = input.title.trim().to_string();
-        let excerpt = input.excerpt.trim().to_string();
         let content = input.content.trim().to_string();
+        let excerpt = resolve_article_excerpt(Some(input.excerpt), &content);
         let status = input.status.unwrap_or_else(|| "draft".to_string());
         let slug = input
             .slug
@@ -1825,7 +2081,6 @@ impl<'a> Database<'a> {
 
         if !matches!(status.as_str(), "draft" | "published")
             || title.is_empty()
-            || excerpt.is_empty()
             || content.is_empty()
             || !is_valid_slug(&slug)
         {
@@ -1896,7 +2151,7 @@ impl<'a> Database<'a> {
                     "Article was not created",
                 )
             })?;
-        build_article_detail(self.conn, article, true)
+        build_article_detail(self.conn, article, true, true)
     }
 
     pub(crate) fn update_article(
@@ -1926,16 +2181,22 @@ impl<'a> Database<'a> {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or(current.slug.clone());
-        let excerpt = input
-            .excerpt
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(current.excerpt.clone());
         let content = input
             .content
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or(current.content.clone());
+        let excerpt = input
+            .excerpt
+            .map(|value| value.trim().to_string())
+            .or_else(|| {
+                if current.excerpt.trim().is_empty() {
+                    None
+                } else {
+                    Some(current.excerpt.clone())
+                }
+            });
+        let excerpt = resolve_article_excerpt(excerpt, &content);
         let cover_image_url = match input.cover_image_url {
             Some(value) => normalize_optional_text(value),
             None => current.cover_image_url.clone(),
@@ -1948,7 +2209,6 @@ impl<'a> Database<'a> {
 
         if !matches!(status.as_str(), "draft" | "published")
             || title.is_empty()
-            || excerpt.is_empty()
             || content.is_empty()
             || !is_valid_slug(&slug)
         {
@@ -2024,7 +2284,7 @@ impl<'a> Database<'a> {
                     "Article was not found",
                 )
             })?;
-        build_article_detail(self.conn, article, true)
+        build_article_detail(self.conn, article, true, true)
     }
 
     pub(crate) fn delete_article(&mut self, article_id: &str) -> Result<(), ApiError> {
@@ -2465,5 +2725,20 @@ impl<'a> Database<'a> {
             .map_err(db_error)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_excerpt_from_markdown_ignores_comment_locked_sections() {
+        let markdown = "Visible intro\n<!-- comment-lock:start -->\nSecret text should not leak\n<!-- comment-lock:end -->\nVisible outro";
+        let excerpt = build_excerpt_from_markdown(markdown, 150);
+
+        assert!(excerpt.contains("Visible intro"));
+        assert!(excerpt.contains("Visible outro"));
+        assert!(!excerpt.contains("Secret text should not leak"));
     }
 }

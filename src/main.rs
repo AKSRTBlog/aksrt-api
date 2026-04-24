@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration as StdDuration};
 
 use axum::{
     body::Body,
@@ -12,8 +12,6 @@ use base64::{engine::general_purpose::STANDARD as Base64Standard, Engine as _};
 use chrono::{Datelike, Duration, NaiveDate, Utc};
 use dotenvy::dotenv;
 use hmac::{Hmac, KeyInit, Mac};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header as JwtHeader, Validation};
-use jsonwebtoken::errors::ErrorKind as JwtErrorKind;
 use lettre::{
     message::{header::ContentType, Mailbox, MultiPart, SinglePart},
     transport::smtp::{
@@ -52,13 +50,11 @@ struct Config {
     cors_origin: String,
     public_site_url: String,
     frontend_dir: String,
-    comment_unlock_jwt_secret: String,
 }
 
 const COMMENT_LOCK_START: &str = "<!-- comment-lock:start -->";
 const COMMENT_LOCK_END: &str = "<!-- comment-lock:end -->";
-const COMMENT_LOCK_PLACEHOLDER: &str =
-    "\n\n> Hidden content. Submit a comment to unlock this section.\n\n";
+const COMMENT_MODERATION_PIPELINE_VERSION: &str = "comment-pipeline-v1";
 
 #[derive(Debug)]
 struct ApiError {
@@ -209,6 +205,7 @@ struct StandalonePageDetailItem {
     summary: String,
     sort_order: i64,
     content: String,
+    contains_comment_locked_content: bool,
 }
 
 #[derive(Clone)]
@@ -285,15 +282,6 @@ struct ArticleDetailItem {
     is_unlocked: bool,
     created_by: String,
     updated_by: String,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct Post {
-    id: String,
-    title: String,
-    public_content: String,
-    hidden_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -435,7 +423,7 @@ struct GeeTestValidationResponse {
     reason: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct CreateCommentInput {
     nickname: String,
@@ -444,15 +432,6 @@ struct CreateCommentInput {
     content: String,
     parent_id: Option<String>,
     captcha: Option<CaptchaInput>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct CommentRequest {
-    nickname: String,
-    email: String,
-    content: String,
-    post_id: String,
 }
 
 #[derive(Deserialize)]
@@ -476,7 +455,7 @@ struct MutationResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CommentSubmissionResult {
+struct PublicCommentSubmissionResult {
     id: String,
     status: String,
     unlock_token: String,
@@ -484,20 +463,92 @@ struct CommentSubmissionResult {
     post_id: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct CommentUnlockClaims {
-    sub: String,
-    post_id: String,
-    exp: usize,
-    iat: usize,
+pub(crate) struct CommentLockedMarkdown {
+    pub(crate) public_content: String,
+    pub(crate) hidden_content: Option<String>,
+    pub(crate) has_hidden_content: bool,
 }
 
-#[derive(Clone)]
-struct ProtectedContent {
-    public_content: String,
-    hidden_content: String,
-    locked_content: String,
+pub(crate) fn split_comment_locked_markdown(markdown: &str) -> CommentLockedMarkdown {
+    let normalized = markdown.replace("\r\n", "\n");
+    let lines = normalized.split('\n').collect::<Vec<_>>();
+    let mut public_content = String::with_capacity(normalized.len());
+    let mut hidden_content = String::new();
+    let mut in_hidden_block = false;
+
+    for (index, line) in lines.iter().enumerate() {
+        let line_with_break = if index + 1 < lines.len() {
+            format!("{line}\n")
+        } else {
+            (*line).to_string()
+        };
+        let trimmed = line.trim();
+
+        if trimmed == COMMENT_LOCK_START {
+            in_hidden_block = true;
+            continue;
+        }
+
+        if trimmed == COMMENT_LOCK_END {
+            in_hidden_block = false;
+            continue;
+        }
+
+        if in_hidden_block {
+            hidden_content.push_str(&line_with_break);
+        } else {
+            public_content.push_str(&line_with_break);
+        }
+    }
+
+    let hidden_content = hidden_content.trim().to_string();
+    let has_hidden_content = !hidden_content.is_empty();
+
+    CommentLockedMarkdown {
+        public_content,
+        hidden_content: if has_hidden_content {
+            Some(hidden_content)
+        } else {
+            None
+        },
+        has_hidden_content,
+    }
+}
+
+pub(crate) fn strip_comment_locked_markdown(markdown: &str) -> String {
+    split_comment_locked_markdown(markdown).public_content
+}
+
+pub(crate) fn render_comment_locked_markdown(markdown: &str, include_hidden: bool) -> String {
+    let normalized = markdown.replace("\r\n", "\n");
+    let lines = normalized.split('\n').collect::<Vec<_>>();
+    let mut rendered = String::with_capacity(normalized.len());
+    let mut in_hidden_block = false;
+
+    for (index, line) in lines.iter().enumerate() {
+        let line_with_break = if index + 1 < lines.len() {
+            format!("{line}\n")
+        } else {
+            (*line).to_string()
+        };
+        let trimmed = line.trim();
+
+        if trimmed == COMMENT_LOCK_START {
+            in_hidden_block = true;
+            continue;
+        }
+
+        if trimmed == COMMENT_LOCK_END {
+            in_hidden_block = false;
+            continue;
+        }
+
+        if !in_hidden_block || include_hidden {
+            rendered.push_str(&line_with_break);
+        }
+    }
+
+    rendered
 }
 
 #[derive(Clone)]
@@ -532,6 +583,23 @@ struct InternalCaptchaConfig {
     enabled_on_comment: bool,
     enabled_on_friend_link: bool,
     enabled_on_login: bool,
+}
+
+struct InternalCommentModerationConfig {
+    enabled: bool,
+    akismet_enabled: bool,
+    akismet_api_key: String,
+    akismet_site_url: String,
+    akismet_blog_lang: String,
+    ai_enabled: bool,
+    ai_provider: String,
+    ai_api_key: String,
+    ai_model: String,
+    auto_approve_low_risk: bool,
+    auto_reject_high_risk: bool,
+    low_risk_max_score: i32,
+    high_risk_min_score: i32,
+    blocked_keywords: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -739,6 +807,26 @@ struct CaptchaAdminConfigItem {
     enabled_on_login: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentModerationAdminConfigItem {
+    id: String,
+    enabled: bool,
+    akismet_enabled: bool,
+    akismet_api_key_configured: bool,
+    akismet_site_url: String,
+    akismet_blog_lang: String,
+    ai_enabled: bool,
+    ai_provider: String,
+    ai_api_key_configured: bool,
+    ai_model: String,
+    auto_approve_low_risk: bool,
+    auto_reject_high_risk: bool,
+    low_risk_max_score: i32,
+    high_risk_min_score: i32,
+    blocked_keywords: Vec<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdatePublicSiteSettingsInput {
@@ -828,6 +916,59 @@ struct UpdateCaptchaConfigInput {
     enabled_on_comment: Option<bool>,
     enabled_on_friend_link: Option<bool>,
     enabled_on_login: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCommentModerationConfigInput {
+    enabled: Option<bool>,
+    akismet_enabled: Option<bool>,
+    akismet_api_key: Option<String>,
+    akismet_site_url: Option<String>,
+    akismet_blog_lang: Option<String>,
+    ai_enabled: Option<bool>,
+    ai_provider: Option<String>,
+    ai_api_key: Option<String>,
+    ai_model: Option<String>,
+    auto_approve_low_risk: Option<bool>,
+    auto_reject_high_risk: Option<bool>,
+    low_risk_max_score: Option<i32>,
+    high_risk_min_score: Option<i32>,
+    blocked_keywords: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CommentModerationAkismetResult {
+    enabled: bool,
+    attempted: bool,
+    is_spam: bool,
+    discard: bool,
+    score: i32,
+    note: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CommentModerationAiResult {
+    enabled: bool,
+    attempted: bool,
+    flagged: bool,
+    score: i32,
+    max_category_score: f64,
+    flagged_categories: Vec<String>,
+    note: String,
+}
+
+#[derive(Clone)]
+struct CommentModerationOutcome {
+    status: String,
+    risk_level: String,
+    risk_score: i32,
+    summary: String,
+    reject_reason: Option<String>,
+    akismet_result: Option<CommentModerationAkismetResult>,
+    ai_result: Option<CommentModerationAiResult>,
 }
 
 #[derive(Deserialize)]
@@ -1010,6 +1151,12 @@ struct AdminCommentItem {
     reviewed_by: Option<String>,
     reviewed_at: Option<String>,
     reject_reason: Option<String>,
+    moderation_risk_level: Option<String>,
+    moderation_risk_score: Option<i32>,
+    moderation_summary: Option<String>,
+    moderation_akismet_raw: Option<String>,
+    moderation_ai_raw: Option<String>,
+    moderation_pipeline_version: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -1192,9 +1339,6 @@ async fn main() {
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
         // API-only by default; set RUST_API_FRONTEND_DIR when backend should serve frontend files.
         frontend_dir: env::var("RUST_API_FRONTEND_DIR").unwrap_or_default(),
-        comment_unlock_jwt_secret: env::var("COMMENT_UNLOCK_JWT_SECRET")
-            .or_else(|_| env::var("RUST_COMMENT_UNLOCK_JWT_SECRET"))
-            .unwrap_or_else(|_| "aksrtblog-comment-unlock-secret-change-me".to_string()),
     });
 
     let state = AppState {
@@ -1332,6 +1476,10 @@ async fn main() {
         .route(
             "/api/v1/admin/site-settings/captcha",
             get(admin_get_captcha_config).put(admin_update_captcha_config),
+        )
+        .route(
+            "/api/v1/admin/site-settings/comment-moderation",
+            get(admin_get_comment_moderation_config).put(admin_update_comment_moderation_config),
         )
         .route(
             "/api/v1/admin/site-settings/captcha/debug/comment",
@@ -1575,133 +1723,6 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
     })
 }
 
-fn build_protected_content(content: &str) -> ProtectedContent {
-    let mut public_content = String::new();
-    let mut hidden_sections = Vec::new();
-    let mut locked_content = String::new();
-    let mut remaining = content;
-
-    while let Some(start_index) = remaining.find(COMMENT_LOCK_START) {
-        let before_hidden = &remaining[..start_index];
-        public_content.push_str(before_hidden);
-        locked_content.push_str(before_hidden);
-
-        let after_start = &remaining[start_index + COMMENT_LOCK_START.len()..];
-        if let Some(end_index) = after_start.find(COMMENT_LOCK_END) {
-            let hidden = &after_start[..end_index];
-            hidden_sections.push(hidden.to_string());
-            locked_content.push_str(COMMENT_LOCK_PLACEHOLDER);
-            remaining = &after_start[end_index + COMMENT_LOCK_END.len()..];
-        } else {
-            hidden_sections.push(after_start.to_string());
-            locked_content.push_str(COMMENT_LOCK_PLACEHOLDER);
-            remaining = "";
-            break;
-        }
-    }
-
-    public_content.push_str(remaining);
-    locked_content.push_str(remaining);
-
-    ProtectedContent {
-        public_content,
-        hidden_content: hidden_sections.join("\n\n"),
-        locked_content,
-    }
-}
-
-fn build_protected_post(article: &ArticleRow, allow_hidden_content: bool) -> (Post, String, bool) {
-    let protected = build_protected_content(&article.content);
-    let requires_comment_unlock = !protected.hidden_content.trim().is_empty();
-    let is_unlocked = !requires_comment_unlock || allow_hidden_content;
-    let content = if is_unlocked {
-        article.content.clone()
-    } else {
-        protected.locked_content.clone()
-    };
-
-    (
-        Post {
-            id: article.id.clone(),
-            title: article.title.clone(),
-            public_content: protected.public_content,
-            hidden_content: if is_unlocked && requires_comment_unlock {
-                Some(protected.hidden_content)
-            } else {
-                None
-            },
-        },
-        content,
-        is_unlocked,
-    )
-}
-
-fn issue_comment_unlock_token(
-    secret: &str,
-    post_id: &str,
-) -> Result<(String, String), ApiError> {
-    let now = Utc::now();
-    let expires_at = now + Duration::hours(24);
-    let claims = CommentUnlockClaims {
-        sub: format!("comment-unlock:{post_id}"),
-        post_id: post_id.to_string(),
-        iat: now.timestamp() as usize,
-        exp: expires_at.timestamp() as usize,
-    };
-
-    let token = encode(
-        &JwtHeader::default(),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .map_err(|error| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "COMMENT_UNLOCK_TOKEN_FAILED",
-            format!("Failed to generate comment unlock token: {error}"),
-        )
-    })?;
-
-    Ok((token, expires_at.to_rfc3339()))
-}
-
-fn has_comment_unlock_access(
-    headers: &HeaderMap,
-    secret: &str,
-    post_id: &str,
-) -> Result<bool, ApiError> {
-    let Some(authorization) = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Ok(false);
-    };
-
-    let Some(token) = authorization.strip_prefix("Bearer ").map(str::trim) else {
-        return Ok(false);
-    };
-
-    if token.is_empty() {
-        return Ok(false);
-    }
-
-    let validation = Validation::default();
-    match decode::<CommentUnlockClaims>(
-        token,
-        &DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    )
-    {
-        Ok(data) => Ok(data.claims.post_id == post_id),
-        Err(error) if matches!(error.kind(), JwtErrorKind::ExpiredSignature) => Err(ApiError::new(
-            StatusCode::UNAUTHORIZED,
-            "COMMENT_UNLOCK_TOKEN_EXPIRED",
-            "Comment unlock credential has expired",
-        )),
-        Err(_) => Ok(false),
-    }
-}
-
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1809,6 +1830,13 @@ fn access_ttl_seconds() -> i64 {
     )
 }
 
+fn comment_unlock_ttl_seconds() -> i64 {
+    parse_duration_seconds(
+        &env::var("COMMENT_UNLOCK_TTL").unwrap_or_else(|_| "30d".to_string()),
+        30 * 24 * 60 * 60,
+    )
+}
+
 fn build_access_token(admin_id: &str, session_id: &str, expires_at: i64) -> String {
     let signature_input = format!("access|{}|{}|{}", session_id, admin_id, expires_at);
     let mut mac =
@@ -1818,6 +1846,18 @@ fn build_access_token(admin_id: &str, session_id: &str, expires_at: i64) -> Stri
     format!(
         "aksrt.access.{}.{}.{}.{}",
         session_id, admin_id, expires_at, signature
+    )
+}
+
+fn build_comment_unlock_token(article_id: &str, comment_id: &str, expires_at: i64) -> String {
+    let signature_input = format!("comment-unlock|{}|{}|{}", article_id, comment_id, expires_at);
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(access_secret().as_bytes()).expect("invalid access secret");
+    mac.update(signature_input.as_bytes());
+    let signature = hex_lower(&mac.finalize().into_bytes());
+    format!(
+        "aksrt.comment-unlock.{}.{}.{}.{}",
+        article_id, comment_id, expires_at, signature
     )
 }
 
@@ -2747,6 +2787,44 @@ fn parse_access_token(token: &str) -> Result<(String, String, i64), ApiError> {
     Ok((session_id, admin_id, expires_at))
 }
 
+fn parse_comment_unlock_token(token: &str) -> Result<(String, String, i64), ApiError> {
+    let parts = token.split('.').collect::<Vec<_>>();
+    if parts.len() != 6 || parts[0] != "aksrt" || parts[1] != "comment-unlock" {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "INVALID_UNLOCK_TOKEN",
+            "Comment unlock token is invalid",
+        ));
+    }
+
+    let article_id = parts[2].to_string();
+    let comment_id = parts[3].to_string();
+    let expires_at = parts[4].parse::<i64>().map_err(|_| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "INVALID_UNLOCK_TOKEN",
+            "Comment unlock token is invalid",
+        )
+    })?;
+    let signature = parts[5];
+
+    let signature_input = format!("comment-unlock|{}|{}|{}", article_id, comment_id, expires_at);
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(access_secret().as_bytes()).expect("invalid access secret");
+    mac.update(signature_input.as_bytes());
+    let expected = hex_lower(&mac.finalize().into_bytes());
+
+    if signature != expected || expires_at <= Utc::now().timestamp() {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "INVALID_UNLOCK_TOKEN",
+            "Comment unlock token is invalid or expired",
+        ));
+    }
+
+    Ok((article_id, comment_id, expires_at))
+}
+
 fn require_admin_auth(state: &AppState, headers: &HeaderMap) -> Result<AdminAuthContext, ApiError> {
     let authorization = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -2918,13 +2996,16 @@ async fn get_public_standalone_page(
                 )
             })?;
 
+        let protected = split_comment_locked_markdown(&page.content);
+
         Ok(ok(StandalonePageDetailItem {
             id: page.id,
             title: page.title,
             slug: page.slug,
             summary: page.summary,
             sort_order: page.sort_order,
-            content: page.content,
+            content: protected.public_content.trim().to_string(),
+            contains_comment_locked_content: protected.has_hidden_content,
         }))
     })
     .await
@@ -2992,6 +3073,145 @@ fn read_internal_captcha_config(conn: &mut PgClient) -> Result<InternalCaptchaCo
             enabled_on_friend_link: false,
             enabled_on_login: false,
         }))
+}
+
+fn normalize_comment_blocked_keywords(values: Vec<String>) -> Vec<String> {
+    let mut output = Vec::<String>::new();
+
+    for item in values {
+        let keyword = item.trim().to_lowercase();
+        if keyword.is_empty() || output.iter().any(|existing| existing == &keyword) {
+            continue;
+        }
+        output.push(keyword);
+    }
+
+    output
+}
+
+fn normalize_comment_moderation_thresholds(
+    low_risk_max_score: i32,
+    high_risk_min_score: i32,
+) -> (i32, i32) {
+    let mut low = low_risk_max_score.clamp(0, 95);
+    let mut high = high_risk_min_score.clamp(5, 100);
+
+    if low >= high {
+        if high <= 5 {
+            high = 5;
+            low = 0;
+        } else {
+            low = high - 5;
+        }
+    }
+
+    (low, high)
+}
+
+fn read_internal_comment_moderation_config(
+    conn: &mut PgClient,
+    fallback_site_url: &str,
+) -> Result<InternalCommentModerationConfig, ApiError> {
+    let row = conn
+        .query_opt(
+            "SELECT enabled, akismet_enabled, akismet_api_key, akismet_site_url, akismet_blog_lang,
+                    ai_enabled, ai_provider, ai_api_key, ai_model, auto_approve_low_risk, auto_reject_high_risk,
+                    low_risk_max_score, high_risk_min_score, blocked_keywords_json::text
+             FROM comment_moderation_configs
+             WHERE id = $1",
+            &[&"default-comment-moderation"],
+        )
+        .map_err(db_error)?;
+
+    let mut config = row
+        .map(|row| {
+            let blocked_keywords = row
+                .get::<usize, String>(13)
+                .parse::<serde_json::Value>()
+                .ok()
+                .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                .unwrap_or_default();
+
+            InternalCommentModerationConfig {
+                enabled: row.get(0),
+                akismet_enabled: row.get(1),
+                akismet_api_key: row.get(2),
+                akismet_site_url: row.get(3),
+                akismet_blog_lang: row.get(4),
+                ai_enabled: row.get(5),
+                ai_provider: row.get(6),
+                ai_api_key: row.get(7),
+                ai_model: row.get(8),
+                auto_approve_low_risk: row.get(9),
+                auto_reject_high_risk: row.get(10),
+                low_risk_max_score: row.get(11),
+                high_risk_min_score: row.get(12),
+                blocked_keywords,
+            }
+        })
+        .unwrap_or(InternalCommentModerationConfig {
+            enabled: true,
+            akismet_enabled: false,
+            akismet_api_key: String::new(),
+            akismet_site_url: fallback_site_url.to_string(),
+            akismet_blog_lang: "zh-CN".to_string(),
+            ai_enabled: false,
+            ai_provider: "openai".to_string(),
+            ai_api_key: String::new(),
+            ai_model: "omni-moderation-latest".to_string(),
+            auto_approve_low_risk: true,
+            auto_reject_high_risk: true,
+            low_risk_max_score: 35,
+            high_risk_min_score: 80,
+            blocked_keywords: Vec::new(),
+        });
+
+    if !validate_url(config.akismet_site_url.trim()) {
+        config.akismet_site_url = fallback_site_url.to_string();
+    }
+
+    config.blocked_keywords = normalize_comment_blocked_keywords(config.blocked_keywords);
+
+    if config.ai_provider.trim().is_empty() {
+        config.ai_provider = "openai".to_string();
+    }
+    if config.ai_model.trim().is_empty() {
+        config.ai_model = "omni-moderation-latest".to_string();
+    }
+    if config.akismet_blog_lang.trim().is_empty() {
+        config.akismet_blog_lang = "zh-CN".to_string();
+    }
+
+    let (low, high) = normalize_comment_moderation_thresholds(
+        config.low_risk_max_score,
+        config.high_risk_min_score,
+    );
+    config.low_risk_max_score = low;
+    config.high_risk_min_score = high;
+
+    Ok(config)
+}
+
+fn to_comment_moderation_admin_config_item(
+    config: InternalCommentModerationConfig,
+) -> CommentModerationAdminConfigItem {
+    CommentModerationAdminConfigItem {
+        id: "default-comment-moderation".to_string(),
+        enabled: config.enabled,
+        akismet_enabled: config.akismet_enabled,
+        akismet_api_key_configured: !config.akismet_api_key.trim().is_empty(),
+        akismet_site_url: config.akismet_site_url,
+        akismet_blog_lang: config.akismet_blog_lang,
+        ai_enabled: config.ai_enabled,
+        ai_provider: config.ai_provider,
+        ai_api_key_configured: !config.ai_api_key.trim().is_empty(),
+        ai_model: config.ai_model,
+        auto_approve_low_risk: config.auto_approve_low_risk,
+        auto_reject_high_risk: config.auto_reject_high_risk,
+        low_risk_max_score: config.low_risk_max_score,
+        high_risk_min_score: config.high_risk_min_score,
+        blocked_keywords: config.blocked_keywords,
+    }
 }
 
 fn validate_geetest_captcha(
@@ -3136,6 +3356,439 @@ fn load_comment_submission_article(
     }
 
     Ok(article)
+}
+
+fn detect_blocked_keywords(content: &str, blocked_keywords: &[String]) -> Vec<String> {
+    if blocked_keywords.is_empty() {
+        return Vec::new();
+    }
+
+    let normalized = content.to_lowercase();
+    blocked_keywords
+        .iter()
+        .filter(|keyword| !keyword.is_empty() && normalized.contains(keyword.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn count_comment_links(content: &str) -> usize {
+    ["http://", "https://", "www.", "]("]
+        .iter()
+        .map(|token| content.matches(token).count())
+        .sum()
+}
+
+fn run_akismet_comment_check(
+    config: &InternalCommentModerationConfig,
+    article: &ArticleRow,
+    input: &CreateCommentInput,
+    ip: Option<&str>,
+    user_agent: Option<&str>,
+    public_site_url: &str,
+) -> CommentModerationAkismetResult {
+    if !config.akismet_enabled {
+        return CommentModerationAkismetResult {
+            enabled: false,
+            attempted: false,
+            is_spam: false,
+            discard: false,
+            score: 0,
+            note: "Akismet check disabled.".to_string(),
+        };
+    }
+
+    let api_key = config.akismet_api_key.trim();
+    if api_key.is_empty() {
+        return CommentModerationAkismetResult {
+            enabled: true,
+            attempted: false,
+            is_spam: false,
+            discard: false,
+            score: 0,
+            note: "Akismet API key missing.".to_string(),
+        };
+    }
+
+    let blog = if validate_url(config.akismet_site_url.trim()) {
+        config.akismet_site_url.trim().to_string()
+    } else {
+        public_site_url.to_string()
+    };
+    let permalink = site_url(public_site_url, &format!("/articles/{}", article.slug));
+    let endpoint = format!("https://{}.rest.akismet.com/1.1/comment-check", api_key);
+
+    let mut form = vec![
+        ("blog", blog),
+        ("blog_lang", config.akismet_blog_lang.trim().to_string()),
+        ("comment_type", "comment".to_string()),
+        ("comment_author", input.nickname.trim().to_string()),
+        ("comment_author_email", input.email.trim().to_string()),
+        (
+            "comment_author_url",
+            input.website.clone().unwrap_or_default().trim().to_string(),
+        ),
+        ("comment_content", input.content.trim().to_string()),
+        ("permalink", permalink),
+    ];
+
+    if let Some(value) = ip {
+        if !value.trim().is_empty() {
+            form.push(("user_ip", value.trim().to_string()));
+        }
+    }
+
+    if let Some(value) = user_agent {
+        if !value.trim().is_empty() {
+            form.push(("user_agent", value.trim().to_string()));
+        }
+    }
+
+    let client = match HttpClient::builder().timeout(StdDuration::from_secs(4)).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return CommentModerationAkismetResult {
+                enabled: true,
+                attempted: false,
+                is_spam: false,
+                discard: false,
+                score: 15,
+                note: format!("Akismet client init failed: {error}"),
+            };
+        }
+    };
+
+    match client
+        .post(endpoint)
+        .header("User-Agent", "AKSRTBlog/1.0 | Akismet/1.1")
+        .form(&form)
+        .send()
+    {
+        Ok(response) => {
+            let discard = response
+                .headers()
+                .get("x-akismet-pro-tip")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.eq_ignore_ascii_case("discard"))
+                .unwrap_or(false);
+
+            match response.text() {
+                Ok(body) => {
+                    let is_spam = body.trim().eq_ignore_ascii_case("true");
+                    let score = if is_spam {
+                        if discard { 95 } else { 75 }
+                    } else {
+                        0
+                    };
+                    CommentModerationAkismetResult {
+                        enabled: true,
+                        attempted: true,
+                        is_spam,
+                        discard,
+                        score,
+                        note: if is_spam {
+                            "Akismet marked this comment as spam.".to_string()
+                        } else {
+                            "Akismet passed.".to_string()
+                        },
+                    }
+                }
+                Err(error) => CommentModerationAkismetResult {
+                    enabled: true,
+                    attempted: true,
+                    is_spam: false,
+                    discard: false,
+                    score: 20,
+                    note: format!("Akismet response parse failed: {error}"),
+                },
+            }
+        }
+        Err(error) => CommentModerationAkismetResult {
+            enabled: true,
+            attempted: true,
+            is_spam: false,
+            discard: false,
+            score: 20,
+            note: format!("Akismet request failed: {error}"),
+        },
+    }
+}
+
+fn run_ai_comment_moderation(
+    config: &InternalCommentModerationConfig,
+    article: &ArticleRow,
+    input: &CreateCommentInput,
+) -> CommentModerationAiResult {
+    if !config.ai_enabled {
+        return CommentModerationAiResult {
+            enabled: false,
+            attempted: false,
+            flagged: false,
+            score: 0,
+            max_category_score: 0.0,
+            flagged_categories: Vec::new(),
+            note: "AI moderation disabled.".to_string(),
+        };
+    }
+
+    if !config.ai_provider.eq_ignore_ascii_case("openai") {
+        return CommentModerationAiResult {
+            enabled: true,
+            attempted: false,
+            flagged: false,
+            score: 20,
+            max_category_score: 0.0,
+            flagged_categories: Vec::new(),
+            note: format!("Unsupported AI provider: {}", config.ai_provider),
+        };
+    }
+
+    let api_key = config.ai_api_key.trim();
+    if api_key.is_empty() {
+        return CommentModerationAiResult {
+            enabled: true,
+            attempted: false,
+            flagged: false,
+            score: 10,
+            max_category_score: 0.0,
+            flagged_categories: Vec::new(),
+            note: "AI moderation API key missing.".to_string(),
+        };
+    }
+
+    let model = if config.ai_model.trim().is_empty() {
+        "omni-moderation-latest"
+    } else {
+        config.ai_model.trim()
+    };
+
+    let input_payload = format!(
+        "Article title: {}\nNickname: {}\nEmail: {}\nWebsite: {}\nComment:\n{}",
+        article.title,
+        input.nickname.trim(),
+        input.email.trim(),
+        input.website.clone().unwrap_or_default().trim(),
+        input.content.trim()
+    );
+
+    let client = match HttpClient::builder().timeout(StdDuration::from_secs(6)).build() {
+        Ok(client) => client,
+        Err(error) => {
+            return CommentModerationAiResult {
+                enabled: true,
+                attempted: false,
+                flagged: false,
+                score: 20,
+                max_category_score: 0.0,
+                flagged_categories: Vec::new(),
+                note: format!("AI moderation client init failed: {error}"),
+            };
+        }
+    };
+
+    let response = client
+        .post("https://api.openai.com/v1/moderations")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "model": model,
+            "input": input_payload,
+        }))
+        .send();
+
+    let response = match response {
+        Ok(value) => value,
+        Err(error) => {
+            return CommentModerationAiResult {
+                enabled: true,
+                attempted: true,
+                flagged: false,
+                score: 25,
+                max_category_score: 0.0,
+                flagged_categories: Vec::new(),
+                note: format!("AI moderation request failed: {error}"),
+            };
+        }
+    };
+
+    let payload: Value = match response.json() {
+        Ok(value) => value,
+        Err(error) => {
+            return CommentModerationAiResult {
+                enabled: true,
+                attempted: true,
+                flagged: false,
+                score: 25,
+                max_category_score: 0.0,
+                flagged_categories: Vec::new(),
+                note: format!("AI moderation response parse failed: {error}"),
+            };
+        }
+    };
+
+    let result = payload
+        .get("results")
+        .and_then(|value| value.as_array())
+        .and_then(|items| items.first());
+
+    let flagged = result
+        .and_then(|value| value.get("flagged"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    let mut max_category_score = 0.0_f64;
+    let mut flagged_categories = Vec::<String>::new();
+    if let Some(scores) = result
+        .and_then(|value| value.get("category_scores"))
+        .and_then(|value| value.as_object())
+    {
+        for (category, score) in scores {
+            if let Some(score) = score.as_f64() {
+                if score > max_category_score {
+                    max_category_score = score;
+                }
+                if score >= 0.35 {
+                    flagged_categories.push(category.to_string());
+                }
+            }
+        }
+    }
+
+    let score = if flagged {
+        if max_category_score >= 0.85 {
+            90
+        } else if max_category_score >= 0.65 {
+            75
+        } else {
+            60
+        }
+    } else if max_category_score >= 0.5 {
+        35
+    } else {
+        0
+    };
+
+    CommentModerationAiResult {
+        enabled: true,
+        attempted: true,
+        flagged,
+        score,
+        max_category_score,
+        flagged_categories,
+        note: if flagged {
+            "AI moderation flagged this comment.".to_string()
+        } else {
+            "AI moderation passed.".to_string()
+        },
+    }
+}
+
+fn evaluate_comment_moderation(
+    config: &InternalCommentModerationConfig,
+    article: &ArticleRow,
+    input: &CreateCommentInput,
+    ip: Option<&str>,
+    user_agent: Option<&str>,
+    public_site_url: &str,
+) -> CommentModerationOutcome {
+    if !config.enabled {
+        return CommentModerationOutcome {
+            status: "pending".to_string(),
+            risk_level: "medium".to_string(),
+            risk_score: 50,
+            summary: "Comment moderation pipeline disabled; queued for manual review.".to_string(),
+            reject_reason: None,
+            akismet_result: None,
+            ai_result: None,
+        };
+    }
+
+    let mut score = 0_i32;
+    let mut reasons = Vec::<String>::new();
+
+    let trimmed_content = input.content.trim();
+    let blocked_keywords = detect_blocked_keywords(trimmed_content, &config.blocked_keywords);
+    if !blocked_keywords.is_empty() {
+        score += 70;
+        reasons.push(format!(
+            "Matched blocked keywords: {}",
+            blocked_keywords.join(", ")
+        ));
+    }
+
+    let link_count = count_comment_links(trimmed_content);
+    if link_count >= 3 {
+        score += 25;
+        reasons.push(format!("Contains many links ({link_count})."));
+    } else if link_count == 2 {
+        score += 15;
+        reasons.push("Contains multiple links.".to_string());
+    }
+
+    if trimmed_content.chars().count() <= 3 {
+        score += 15;
+        reasons.push("Comment content is too short.".to_string());
+    }
+
+    let akismet_result =
+        run_akismet_comment_check(config, article, input, ip, user_agent, public_site_url);
+    if akismet_result.enabled {
+        score += akismet_result.score;
+        reasons.push(akismet_result.note.clone());
+    }
+
+    let ai_result = run_ai_comment_moderation(config, article, input);
+    if ai_result.enabled {
+        score += ai_result.score;
+        reasons.push(ai_result.note.clone());
+    }
+
+    score = score.clamp(0, 100);
+    let risk_level = if score >= config.high_risk_min_score {
+        "high"
+    } else if score <= config.low_risk_max_score {
+        "low"
+    } else {
+        "medium"
+    };
+
+    let status = match risk_level {
+        "high" if config.auto_reject_high_risk => "rejected".to_string(),
+        "low" if config.auto_approve_low_risk => "approved".to_string(),
+        _ => "pending".to_string(),
+    };
+    let reject_reason = if status == "rejected" {
+        Some("Rejected by automated moderation pipeline.".to_string())
+    } else {
+        None
+    };
+
+    let summary = if reasons.is_empty() {
+        format!(
+            "Risk score {score} ({risk_level}), auto decision: {status}.",
+        )
+    } else {
+        format!(
+            "Risk score {score} ({risk_level}), auto decision: {status}. Signals: {}",
+            reasons.join(" | ")
+        )
+    };
+
+    CommentModerationOutcome {
+        status,
+        risk_level: risk_level.to_string(),
+        risk_score: score,
+        summary,
+        reject_reason,
+        akismet_result: if akismet_result.enabled {
+            Some(akismet_result)
+        } else {
+            None
+        },
+        ai_result: if ai_result.enabled {
+            Some(ai_result)
+        } else {
+            None
+        },
+    }
 }
 
 fn preview_captcha_value(value: &str) -> String {
@@ -3962,8 +4615,8 @@ async fn list_public_categories(
 
 async fn get_public_article(
     State(state): State<AppState>,
-    Path(slug): Path<String>,
     headers: HeaderMap,
+    Path(slug): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     run_blocking(move || {
         let mut conn = open_connection(&state)?;
@@ -3978,9 +4631,37 @@ async fn get_public_article(
                 )
             })?;
 
-        let unlocked =
-            has_comment_unlock_access(&headers, &state.config.comment_unlock_jwt_secret, &article.id)?;
-        Ok(ok(build_article_detail(&mut conn, article, unlocked)?))
+        let unlock_granted = match headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some(value) if !value.trim().is_empty() => {
+                let token = value.strip_prefix("Bearer ").ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::UNAUTHORIZED,
+                        "UNAUTHORIZED",
+                        "Authorization header is invalid",
+                    )
+                })?;
+                let (article_id, _, _) = parse_comment_unlock_token(token)?;
+                if article_id != article.id {
+                    return Err(ApiError::new(
+                        StatusCode::UNAUTHORIZED,
+                        "INVALID_UNLOCK_TOKEN",
+                        "Comment unlock token does not match this article",
+                    ));
+                }
+                true
+            }
+            _ => false,
+        };
+
+        Ok(ok(build_article_detail(
+            &mut conn,
+            article,
+            unlock_granted,
+            false,
+        )?))
     })
     .await
 }
@@ -4030,68 +4711,81 @@ async fn submit_public_comment(
 ) -> Result<impl IntoResponse, ApiError> {
     let public_site_url = state.config.public_site_url.clone();
     let database_url = state.config.database_url.clone();
-    let comment_unlock_jwt_secret = state.config.comment_unlock_jwt_secret.clone();
     let result = run_blocking(move || {
         let mut conn = open_connection(&state)?;
         let article =
             load_comment_submission_article(&mut conn, &state.config.public_site_url, &slug)?;
-        let comment_request = CommentRequest {
-            nickname: input.nickname.trim().to_string(),
-            email: input.email.trim().to_string(),
-            content: input.content.trim().to_string(),
-            post_id: article.id.clone(),
-        };
         validate_geetest_captcha(&state, &mut conn, "comment", input.captcha.as_ref())?;
-        let notification = PendingCommentNotification {
+        let moderation_config =
+            read_internal_comment_moderation_config(&mut conn, &state.config.public_site_url)?;
+        let mut notification = PendingCommentNotification {
             article_title: article.title.clone(),
             article_slug: article.slug.clone(),
-            nickname: comment_request.nickname.clone(),
-            email: comment_request.email.clone(),
+            nickname: input.nickname.trim().to_string(),
+            email: input.email.trim().to_string(),
             website: normalize_optional_text(input.website.clone()),
-            content: comment_request.content.clone(),
+            content: input.content.trim().to_string(),
             parent_id: input.parent_id.clone(),
             status: "pending".to_string(),
         };
         let (ip, user_agent) = extract_client_meta(&headers);
-        let result = Database::new(&mut conn).create_public_comment(
+        let created = Database::new(&mut conn).create_public_comment(
             &article.id,
-            input,
-            ip,
-            user_agent,
+            input.clone(),
+            ip.clone(),
+            user_agent.clone(),
         )?;
-        Ok((result, article, notification))
+        let moderation = evaluate_comment_moderation(
+            &moderation_config,
+            &article,
+            &input,
+            ip.as_deref(),
+            user_agent.as_deref(),
+            &state.config.public_site_url,
+        );
+        let final_result = Database::new(&mut conn).apply_comment_moderation_outcome(
+            &created.id,
+            moderation,
+        )?;
+        notification.status = final_result.status.clone();
+
+        Ok((final_result, article, notification))
     })
     .await?;
 
-    let (_, article, notification) = &result;
+    let (comment_result, article, notification) = &result;
     let article = article.clone();
-    let post_id = article.id.clone();
+    let unlock_expires_at = Utc::now() + Duration::seconds(comment_unlock_ttl_seconds());
+    let unlock_token = build_comment_unlock_token(
+        &article.id,
+        &comment_result.id,
+        unlock_expires_at.timestamp(),
+    );
     let article_for_notification = article.clone();
     let notification = notification.clone();
-    tokio::spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            if let Ok(mut conn) = PgClient::connect(&database_url, NoTls) {
-                try_send_pending_comment_notification(
-                    &mut conn,
-                    &public_site_url,
-                    &article_for_notification,
-                    &notification,
-                );
-            }
-        })
-        .await
-        .ok();
-    });
+    if notification.status == "pending" {
+        tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                if let Ok(mut conn) = PgClient::connect(&database_url, NoTls) {
+                    try_send_pending_comment_notification(
+                        &mut conn,
+                        &public_site_url,
+                        &article_for_notification,
+                        &notification,
+                    );
+                }
+            })
+            .await
+            .ok();
+        });
+    }
 
-    let (unlock_token, unlock_token_expires_at) =
-        issue_comment_unlock_token(&comment_unlock_jwt_secret, &post_id)?;
-
-    Ok(created(CommentSubmissionResult {
-        id: result.0.id,
-        status: result.0.status,
+    Ok(created(PublicCommentSubmissionResult {
+        id: comment_result.id.clone(),
+        status: comment_result.status.clone(),
         unlock_token,
-        unlock_token_expires_at,
-        post_id,
+        unlock_token_expires_at: unlock_expires_at.to_rfc3339(),
+        post_id: article.id.clone(),
     }))
 }
 
@@ -4754,6 +5448,37 @@ async fn admin_update_captcha_config(
     .await
 }
 
+async fn admin_get_comment_moderation_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    let public_site_url = state.config.public_site_url.clone();
+    run_blocking(move || {
+        let _auth = require_admin_auth(&state, &headers)?;
+        let mut conn = open_connection(&state)?;
+        let config = read_internal_comment_moderation_config(&mut conn, &public_site_url)?;
+        Ok(ok(to_comment_moderation_admin_config_item(config)))
+    })
+    .await
+}
+
+async fn admin_update_comment_moderation_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdateCommentModerationConfigInput>,
+) -> Result<impl IntoResponse, ApiError> {
+    let public_site_url = state.config.public_site_url.clone();
+    run_blocking(move || {
+        let _auth = require_admin_auth(&state, &headers)?;
+        let mut conn = open_connection(&state)?;
+        Ok(ok(Database::new(&mut conn).update_comment_moderation_config(
+            &public_site_url,
+            input,
+        )?))
+    })
+    .await
+}
+
 async fn admin_debug_comment_captcha(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4880,7 +5605,10 @@ fn load_admin_comment_items(conn: &mut PgClient) -> Result<Vec<AdminCommentItem>
     let rows = conn
         .query(
             "SELECT c.id, c.article_id, a.title, a.slug, c.parent_id, c.nickname, c.email, c.website, c.content, c.status,
-                    c.reviewed_by, c.reviewed_at::text, c.reject_reason, c.created_at::text, c.updated_at::text
+                    c.reviewed_by, c.reviewed_at::text, c.reject_reason,
+                    c.moderation_risk_level, c.moderation_risk_score, c.moderation_summary,
+                    c.moderation_akismet_json::text, c.moderation_ai_json::text, c.moderation_pipeline_version,
+                    c.created_at::text, c.updated_at::text
              FROM comments c
              JOIN articles a ON a.id = c.article_id
              ORDER BY c.created_at DESC",
@@ -4926,8 +5654,14 @@ fn load_admin_comment_items(conn: &mut PgClient) -> Result<Vec<AdminCommentItem>
                 reviewed_by: row.get(10),
                 reviewed_at: row.get(11),
                 reject_reason: row.get(12),
-                created_at: row.get(13),
-                updated_at: row.get(14),
+                moderation_risk_level: row.get(13),
+                moderation_risk_score: row.get(14),
+                moderation_summary: row.get(15),
+                moderation_akismet_raw: row.get(16),
+                moderation_ai_raw: row.get(17),
+                moderation_pipeline_version: row.get(18),
+                created_at: row.get(19),
+                updated_at: row.get(20),
             }
         })
         .collect())
@@ -5632,7 +6366,7 @@ async fn admin_get_article(
                     "Article was not found",
                 )
             })?;
-        Ok(ok(build_article_detail(&mut conn, article, true)?))
+        Ok(ok(build_article_detail(&mut conn, article, true, true)?))
     })
     .await
 }
@@ -6646,20 +7380,49 @@ fn build_article_summary(
     })
 }
 
+fn build_article_content_view(
+    raw_content: &str,
+    unlock_granted: bool,
+) -> (String, String, Option<String>, bool, bool) {
+    let protected = split_comment_locked_markdown(raw_content);
+    let requires_comment_unlock = protected.has_hidden_content;
+    let is_unlocked = !requires_comment_unlock || unlock_granted;
+    let public_content = render_comment_locked_markdown(raw_content, false);
+    let content = render_comment_locked_markdown(raw_content, is_unlocked);
+    let hidden_content = if is_unlocked {
+        protected.hidden_content
+    } else {
+        None
+    };
+
+    (
+        content,
+        public_content,
+        hidden_content,
+        requires_comment_unlock,
+        is_unlocked,
+    )
+}
+
 fn build_article_detail(
     conn: &mut PgClient,
     article: ArticleRow,
-    allow_hidden_content: bool,
+    unlock_granted: bool,
+    preserve_raw_content: bool,
 ) -> Result<ArticleDetailItem, ApiError> {
     let summary = build_article_summary(conn, article.clone())?;
-    let (post, content, is_unlocked) = build_protected_post(&article, allow_hidden_content);
-    let requires_comment_unlock = post.hidden_content.is_some() || article.content != post.public_content;
+    let (content, public_content, hidden_content, requires_comment_unlock, is_unlocked) =
+        build_article_content_view(&article.content, unlock_granted);
 
     Ok(ArticleDetailItem {
         summary,
-        content,
-        public_content: post.public_content,
-        hidden_content: post.hidden_content,
+        content: if preserve_raw_content {
+            article.content
+        } else {
+            content
+        },
+        public_content,
+        hidden_content,
         requires_comment_unlock,
         is_unlocked,
         created_by: article.created_by,
@@ -6935,4 +7698,63 @@ async fn get_sitemap(State(state): State<AppState>) -> Result<impl IntoResponse,
         .unwrap())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_comment_locked_markdown_separates_public_and_hidden_sections() {
+        let markdown = "before\n<!-- comment-lock:start -->\nhidden\n<!-- comment-lock:end -->\nafter";
+        let protected = split_comment_locked_markdown(markdown);
+
+        assert_eq!(protected.public_content, "before\nafter");
+        assert_eq!(protected.hidden_content.as_deref(), Some("hidden"));
+        assert!(protected.has_hidden_content);
+    }
+
+    #[test]
+    fn render_comment_locked_markdown_preserves_original_order_when_unlocked() {
+        let markdown = "alpha\n<!-- comment-lock:start -->\nbeta\n<!-- comment-lock:end -->\ngamma\n<!-- comment-lock:start -->\ndelta\n<!-- comment-lock:end -->\nomega";
+
+        assert_eq!(
+            render_comment_locked_markdown(markdown, false),
+            "alpha\ngamma\nomega"
+        );
+        assert_eq!(
+            render_comment_locked_markdown(markdown, true),
+            "alpha\nbeta\ngamma\ndelta\nomega"
+        );
+    }
+
+    #[test]
+    fn build_article_content_view_hides_locked_content_until_unlock() {
+        let markdown = "intro\n<!-- comment-lock:start -->\nsecret\n<!-- comment-lock:end -->\noutro";
+
+        let locked = build_article_content_view(markdown, false);
+        assert_eq!(locked.0, "intro\noutro");
+        assert_eq!(locked.1, "intro\noutro");
+        assert_eq!(locked.2, None);
+        assert!(locked.3);
+        assert!(!locked.4);
+
+        let unlocked = build_article_content_view(markdown, true);
+        assert_eq!(unlocked.0, "intro\nsecret\noutro");
+        assert_eq!(unlocked.1, "intro\noutro");
+        assert_eq!(unlocked.2.as_deref(), Some("secret"));
+        assert!(unlocked.3);
+        assert!(unlocked.4);
+    }
+
+    #[test]
+    fn comment_unlock_token_round_trips() {
+        let expires_at = Utc::now().timestamp() + 3600;
+        let token = build_comment_unlock_token("article-1", "comment-2", expires_at);
+        let parsed = parse_comment_unlock_token(&token).expect("token should parse");
+
+        assert_eq!(parsed.0, "article-1");
+        assert_eq!(parsed.1, "comment-2");
+        assert_eq!(parsed.2, expires_at);
+    }
 }

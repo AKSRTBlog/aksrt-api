@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::STANDARD as Base64Standard, Engine as _};
 use chrono::{Datelike, Duration, NaiveDate, Utc};
 use dotenvy::dotenv;
 use hmac::{Hmac, KeyInit, Mac};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header as JwtHeader, Validation};
 use lettre::{
     message::{header::ContentType, Mailbox, MultiPart, SinglePart},
     transport::smtp::{
@@ -50,7 +51,13 @@ struct Config {
     cors_origin: String,
     public_site_url: String,
     frontend_dir: String,
+    comment_unlock_jwt_secret: String,
 }
+
+const COMMENT_LOCK_START: &str = "<!-- comment-lock:start -->";
+const COMMENT_LOCK_END: &str = "<!-- comment-lock:end -->";
+const COMMENT_LOCK_PLACEHOLDER: &str =
+    "\n\n> Hidden content. Submit a comment to unlock this section.\n\n";
 
 #[derive(Debug)]
 struct ApiError {
@@ -271,8 +278,21 @@ struct ArticleDetailItem {
     #[serde(flatten)]
     summary: ArticleSummaryItem,
     content: String,
+    public_content: String,
+    hidden_content: Option<String>,
+    requires_comment_unlock: bool,
+    is_unlocked: bool,
     created_by: String,
     updated_by: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct Post {
+    id: String,
+    title: String,
+    public_content: String,
+    hidden_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -425,6 +445,15 @@ struct CreateCommentInput {
     captcha: Option<CaptchaInput>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CommentRequest {
+    nickname: String,
+    email: String,
+    content: String,
+    post_id: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateFriendLinkApplicationInput {
@@ -442,6 +471,32 @@ struct CreateFriendLinkApplicationInput {
 struct MutationResult {
     id: String,
     status: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommentSubmissionResult {
+    id: String,
+    status: String,
+    unlock_token: String,
+    unlock_token_expires_at: String,
+    post_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CommentUnlockClaims {
+    sub: String,
+    post_id: String,
+    exp: usize,
+    iat: usize,
+}
+
+#[derive(Clone)]
+struct ProtectedContent {
+    public_content: String,
+    hidden_content: String,
+    locked_content: String,
 }
 
 #[derive(Clone)]
@@ -1136,6 +1191,9 @@ async fn main() {
             .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string()),
         // API-only by default; set RUST_API_FRONTEND_DIR when backend should serve frontend files.
         frontend_dir: env::var("RUST_API_FRONTEND_DIR").unwrap_or_default(),
+        comment_unlock_jwt_secret: env::var("COMMENT_UNLOCK_JWT_SECRET")
+            .or_else(|_| env::var("RUST_COMMENT_UNLOCK_JWT_SECRET"))
+            .unwrap_or_else(|_| "aksrtblog-comment-unlock-secret-change-me".to_string()),
     });
 
     let state = AppState {
@@ -1514,6 +1572,126 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
             Some(trimmed)
         }
     })
+}
+
+fn build_protected_content(content: &str) -> ProtectedContent {
+    let mut public_content = String::new();
+    let mut hidden_sections = Vec::new();
+    let mut locked_content = String::new();
+    let mut remaining = content;
+
+    while let Some(start_index) = remaining.find(COMMENT_LOCK_START) {
+        let before_hidden = &remaining[..start_index];
+        public_content.push_str(before_hidden);
+        locked_content.push_str(before_hidden);
+
+        let after_start = &remaining[start_index + COMMENT_LOCK_START.len()..];
+        if let Some(end_index) = after_start.find(COMMENT_LOCK_END) {
+            let hidden = &after_start[..end_index];
+            hidden_sections.push(hidden.to_string());
+            locked_content.push_str(COMMENT_LOCK_PLACEHOLDER);
+            remaining = &after_start[end_index + COMMENT_LOCK_END.len()..];
+        } else {
+            hidden_sections.push(after_start.to_string());
+            locked_content.push_str(COMMENT_LOCK_PLACEHOLDER);
+            remaining = "";
+            break;
+        }
+    }
+
+    public_content.push_str(remaining);
+    locked_content.push_str(remaining);
+
+    ProtectedContent {
+        public_content,
+        hidden_content: hidden_sections.join("\n\n"),
+        locked_content,
+    }
+}
+
+fn build_protected_post(article: &ArticleRow, allow_hidden_content: bool) -> (Post, String, bool) {
+    let protected = build_protected_content(&article.content);
+    let requires_comment_unlock = !protected.hidden_content.trim().is_empty();
+    let is_unlocked = !requires_comment_unlock || allow_hidden_content;
+    let content = if is_unlocked {
+        article.content.clone()
+    } else {
+        protected.locked_content.clone()
+    };
+
+    (
+        Post {
+            id: article.id.clone(),
+            title: article.title.clone(),
+            public_content: protected.public_content,
+            hidden_content: if is_unlocked && requires_comment_unlock {
+                Some(protected.hidden_content)
+            } else {
+                None
+            },
+        },
+        content,
+        is_unlocked,
+    )
+}
+
+fn issue_comment_unlock_token(
+    secret: &str,
+    post_id: &str,
+) -> Result<(String, String), ApiError> {
+    let now = Utc::now();
+    let expires_at = now + Duration::hours(24);
+    let claims = CommentUnlockClaims {
+        sub: format!("comment-unlock:{post_id}"),
+        post_id: post_id.to_string(),
+        iat: now.timestamp() as usize,
+        exp: expires_at.timestamp() as usize,
+    };
+
+    let token = encode(
+        &JwtHeader::default(),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "COMMENT_UNLOCK_TOKEN_FAILED",
+            format!("Failed to generate comment unlock token: {error}"),
+        )
+    })?;
+
+    Ok((token, expires_at.to_rfc3339()))
+}
+
+fn has_comment_unlock_access(
+    headers: &HeaderMap,
+    secret: &str,
+    post_id: &str,
+) -> bool {
+    let Some(authorization) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+
+    let Some(token) = authorization.strip_prefix("Bearer ").map(str::trim) else {
+        return false;
+    };
+
+    if token.is_empty() {
+        return false;
+    }
+
+    let validation = Validation::default();
+    decode::<CommentUnlockClaims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map(|data| data.claims.post_id == post_id)
+    .unwrap_or(false)
 }
 
 fn escape_html(value: &str) -> String {
@@ -3777,6 +3955,7 @@ async fn list_public_categories(
 async fn get_public_article(
     State(state): State<AppState>,
     Path(slug): Path<String>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     run_blocking(move || {
         let mut conn = open_connection(&state)?;
@@ -3791,7 +3970,9 @@ async fn get_public_article(
                 )
             })?;
 
-        Ok(ok(build_article_detail(&mut conn, article)?))
+        let unlocked =
+            has_comment_unlock_access(&headers, &state.config.comment_unlock_jwt_secret, &article.id);
+        Ok(ok(build_article_detail(&mut conn, article, unlocked)?))
     })
     .await
 }
@@ -3841,18 +4022,25 @@ async fn submit_public_comment(
 ) -> Result<impl IntoResponse, ApiError> {
     let public_site_url = state.config.public_site_url.clone();
     let database_url = state.config.database_url.clone();
+    let comment_unlock_jwt_secret = state.config.comment_unlock_jwt_secret.clone();
     let result = run_blocking(move || {
         let mut conn = open_connection(&state)?;
         let article =
             load_comment_submission_article(&mut conn, &state.config.public_site_url, &slug)?;
+        let comment_request = CommentRequest {
+            nickname: input.nickname.trim().to_string(),
+            email: input.email.trim().to_string(),
+            content: input.content.trim().to_string(),
+            post_id: article.id.clone(),
+        };
         validate_geetest_captcha(&state, &mut conn, "comment", input.captcha.as_ref())?;
         let notification = PendingCommentNotification {
             article_title: article.title.clone(),
             article_slug: article.slug.clone(),
-            nickname: input.nickname.trim().to_string(),
-            email: input.email.trim().to_string(),
+            nickname: comment_request.nickname.clone(),
+            email: comment_request.email.clone(),
             website: normalize_optional_text(input.website.clone()),
-            content: input.content.trim().to_string(),
+            content: comment_request.content.clone(),
             parent_id: input.parent_id.clone(),
             status: "pending".to_string(),
         };
@@ -3869,6 +4057,8 @@ async fn submit_public_comment(
 
     let (_, article, notification) = &result;
     let article = article.clone();
+    let post_id = article.id.clone();
+    let article_for_notification = article.clone();
     let notification = notification.clone();
     tokio::spawn(async move {
         tokio::task::spawn_blocking(move || {
@@ -3876,7 +4066,7 @@ async fn submit_public_comment(
                 try_send_pending_comment_notification(
                     &mut conn,
                     &public_site_url,
-                    &article,
+                    &article_for_notification,
                     &notification,
                 );
             }
@@ -3885,7 +4075,16 @@ async fn submit_public_comment(
         .ok();
     });
 
-    Ok(created(result.0))
+    let (unlock_token, unlock_token_expires_at) =
+        issue_comment_unlock_token(&comment_unlock_jwt_secret, &post_id)?;
+
+    Ok(created(CommentSubmissionResult {
+        id: result.0.id,
+        status: result.0.status,
+        unlock_token,
+        unlock_token_expires_at,
+        post_id,
+    }))
 }
 
 async fn submit_public_friend_link_application(
@@ -5425,7 +5624,7 @@ async fn admin_get_article(
                     "Article was not found",
                 )
             })?;
-        Ok(ok(build_article_detail(&mut conn, article)?))
+        Ok(ok(build_article_detail(&mut conn, article, true)?))
     })
     .await
 }
@@ -6442,12 +6641,19 @@ fn build_article_summary(
 fn build_article_detail(
     conn: &mut PgClient,
     article: ArticleRow,
+    allow_hidden_content: bool,
 ) -> Result<ArticleDetailItem, ApiError> {
     let summary = build_article_summary(conn, article.clone())?;
+    let (post, content, is_unlocked) = build_protected_post(&article, allow_hidden_content);
+    let requires_comment_unlock = post.hidden_content.is_some() || article.content != post.public_content;
 
     Ok(ArticleDetailItem {
         summary,
-        content: article.content,
+        content,
+        public_content: post.public_content,
+        hidden_content: post.hidden_content,
+        requires_comment_unlock,
+        is_unlocked,
         created_by: article.created_by,
         updated_by: article.updated_by,
     })

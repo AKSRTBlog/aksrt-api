@@ -1824,7 +1824,7 @@ impl<'a> Database<'a> {
                     "Article was not created",
                 )
             })?;
-        build_article_detail(self.conn, article)
+        build_article_detail(self.conn, article, true)
     }
 
     pub(crate) fn update_article(
@@ -1952,7 +1952,7 @@ impl<'a> Database<'a> {
                     "Article was not found",
                 )
             })?;
-        build_article_detail(self.conn, article)
+        build_article_detail(self.conn, article, true)
     }
 
     pub(crate) fn delete_article(&mut self, article_id: &str) -> Result<(), ApiError> {

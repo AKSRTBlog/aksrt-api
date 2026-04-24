@@ -6,10 +6,13 @@ use uuid::Uuid;
 
 use crate::*;
 
-const COMMENT_PER_ARTICLE_LIMIT_WINDOW_MINUTES: i64 = 10;
-const COMMENT_PER_ARTICLE_LIMIT_MAX: i64 = 1;
-const COMMENT_GLOBAL_LIMIT_WINDOW_MINUTES: i64 = 60;
-const COMMENT_GLOBAL_LIMIT_MAX: i64 = 6;
+const DEFAULT_COMMENT_MIN_INTERVAL_SECONDS: i64 = 8;
+const DEFAULT_COMMENT_PER_ARTICLE_WINDOW_MINUTES: i64 = 10;
+const DEFAULT_COMMENT_PER_ARTICLE_EMAIL_MAX: i64 = 3;
+const DEFAULT_COMMENT_PER_ARTICLE_IP_MAX: i64 = 0;
+const DEFAULT_COMMENT_GLOBAL_WINDOW_MINUTES: i64 = 60;
+const DEFAULT_COMMENT_GLOBAL_EMAIL_MAX: i64 = 15;
+const DEFAULT_COMMENT_GLOBAL_IP_MAX: i64 = 60;
 
 pub(crate) struct Database<'a> {
     conn: &'a mut PgClient,
@@ -173,61 +176,148 @@ impl<'a> Database<'a> {
         article_id: &str,
         email: &str,
         ip: Option<&str>,
+        moderation_config: &InternalCommentModerationConfig,
     ) -> Result<(), ApiError> {
-        let recent_article_comments: i64 = self
-            .conn
-            .query_one(
-                "SELECT COUNT(*)::BIGINT
-                 FROM comments
-                 WHERE article_id = $1
-                   AND created_at >= NOW() - ($2::TEXT || ' minutes')::INTERVAL
-                   AND (
-                     LOWER(email) = LOWER($3)
-                     OR ($4::TEXT IS NOT NULL AND ip = $4)
-                   )",
-                &[
-                    &article_id,
-                    &COMMENT_PER_ARTICLE_LIMIT_WINDOW_MINUTES.to_string(),
-                    &email,
-                    &ip,
-                ],
-            )
-            .map_err(db_error)?
-            .get(0);
-
-        if recent_article_comments >= COMMENT_PER_ARTICLE_LIMIT_MAX {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "COMMENT_RATE_LIMITED",
-                "You are commenting too frequently on this article. Please try again later.",
-            ));
+        if !moderation_config.rate_limit_enabled {
+            return Ok(());
         }
 
-        let recent_global_comments: i64 = self
-            .conn
-            .query_one(
-                "SELECT COUNT(*)::BIGINT
-                 FROM comments
-                 WHERE created_at >= NOW() - ($1::TEXT || ' minutes')::INTERVAL
-                   AND (
-                     LOWER(email) = LOWER($2)
-                     OR ($3::TEXT IS NOT NULL AND ip = $3)
-                   )",
-                &[
-                    &COMMENT_GLOBAL_LIMIT_WINDOW_MINUTES.to_string(),
-                    &email,
-                    &ip,
-                ],
-            )
-            .map_err(db_error)?
-            .get(0);
+        let min_interval_seconds = i64::from(moderation_config.rate_limit_min_interval_seconds);
+        let per_article_window_minutes =
+            i64::from(moderation_config.rate_limit_per_article_window_minutes);
+        let per_article_email_max = i64::from(moderation_config.rate_limit_per_article_email_max);
+        let per_article_ip_max = i64::from(moderation_config.rate_limit_per_article_ip_max);
+        let global_window_minutes = i64::from(moderation_config.rate_limit_global_window_minutes);
+        let global_email_max = i64::from(moderation_config.rate_limit_global_email_max);
+        let global_ip_max = i64::from(moderation_config.rate_limit_global_ip_max);
 
-        if recent_global_comments >= COMMENT_GLOBAL_LIMIT_MAX {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "COMMENT_RATE_LIMITED",
-                "Too many comment attempts detected. Please try again later.",
-            ));
+        if min_interval_seconds > 0 {
+            let recent_same_article_by_email: i64 = self
+                .conn
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT
+                     FROM comments
+                     WHERE article_id = $1
+                       AND LOWER(email) = LOWER($2)
+                       AND created_at >= NOW() - ($3::TEXT || ' seconds')::INTERVAL",
+                    &[
+                        &article_id,
+                        &email,
+                        &min_interval_seconds.to_string(),
+                    ],
+                )
+                .map_err(db_error)?
+                .get(0);
+
+            if recent_same_article_by_email > 0 {
+                return Err(ApiError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "COMMENT_RATE_LIMITED",
+                    "Please wait a few seconds before posting another comment.",
+                ));
+            }
+        }
+
+        if per_article_window_minutes > 0 && per_article_email_max > 0 {
+            let recent_article_email_comments: i64 = self
+                .conn
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT
+                     FROM comments
+                     WHERE article_id = $1
+                       AND created_at >= NOW() - ($2::TEXT || ' minutes')::INTERVAL
+                       AND LOWER(email) = LOWER($3)",
+                    &[
+                        &article_id,
+                        &per_article_window_minutes.to_string(),
+                        &email,
+                    ],
+                )
+                .map_err(db_error)?
+                .get(0);
+
+            if recent_article_email_comments >= per_article_email_max {
+                return Err(ApiError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "COMMENT_RATE_LIMITED",
+                    "You're commenting a bit too quickly on this article. Please try again later.",
+                ));
+            }
+        }
+
+        if per_article_window_minutes > 0 && per_article_ip_max > 0 {
+            if let Some(client_ip) = ip {
+                let recent_article_ip_comments: i64 = self
+                    .conn
+                    .query_one(
+                        "SELECT COUNT(*)::BIGINT
+                         FROM comments
+                         WHERE article_id = $1
+                           AND created_at >= NOW() - ($2::TEXT || ' minutes')::INTERVAL
+                           AND ip = $3",
+                        &[
+                            &article_id,
+                            &per_article_window_minutes.to_string(),
+                            &client_ip,
+                        ],
+                    )
+                    .map_err(db_error)?
+                    .get(0);
+
+                if recent_article_ip_comments >= per_article_ip_max {
+                    return Err(ApiError::new(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "COMMENT_RATE_LIMITED",
+                        "Too many comments from your network on this article. Please try again later.",
+                    ));
+                }
+            }
+        }
+
+        if global_window_minutes > 0 && global_email_max > 0 {
+            let recent_global_email_comments: i64 = self
+                .conn
+                .query_one(
+                    "SELECT COUNT(*)::BIGINT
+                     FROM comments
+                     WHERE created_at >= NOW() - ($1::TEXT || ' minutes')::INTERVAL
+                       AND LOWER(email) = LOWER($2)",
+                    &[&global_window_minutes.to_string(), &email],
+                )
+                .map_err(db_error)?
+                .get(0);
+
+            if recent_global_email_comments >= global_email_max {
+                return Err(ApiError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "COMMENT_RATE_LIMITED",
+                    "Too many comment attempts detected in a short period. Please try again later.",
+                ));
+            }
+        }
+
+        if global_window_minutes > 0 && global_ip_max > 0 {
+            if let Some(client_ip) = ip {
+                let recent_global_ip_comments: i64 = self
+                    .conn
+                    .query_one(
+                        "SELECT COUNT(*)::BIGINT
+                         FROM comments
+                         WHERE created_at >= NOW() - ($1::TEXT || ' minutes')::INTERVAL
+                           AND ip = $2",
+                        &[&global_window_minutes.to_string(), &client_ip],
+                    )
+                    .map_err(db_error)?
+                    .get(0);
+
+                if recent_global_ip_comments >= global_ip_max {
+                    return Err(ApiError::new(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "COMMENT_RATE_LIMITED",
+                        "Too many comment attempts from your network. Please try again later.",
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -469,15 +559,29 @@ impl<'a> Database<'a> {
                         ai_enabled, ai_provider, ai_api_key, ai_model,
                         auto_approve_low_risk, auto_reject_high_risk,
                         low_risk_max_score, high_risk_min_score, blocked_keywords_json,
+                        rate_limit_enabled, rate_limit_min_interval_seconds,
+                        rate_limit_per_article_window_minutes, rate_limit_per_article_email_max, rate_limit_per_article_ip_max,
+                        rate_limit_global_window_minutes, rate_limit_global_email_max, rate_limit_global_ip_max,
                         created_at, updated_at
                      ) VALUES (
                         $1, TRUE, FALSE, '', $2, 'zh-CN',
                         FALSE, 'openai', '', 'omni-moderation-latest',
                         TRUE, TRUE,
                         35, 80, '[]'::jsonb,
+                        TRUE, $3, $4, $5, $6, $7, $8, $9,
                         NOW(), NOW()
                      )",
-                    &[&"default-comment-moderation", &config.public_site_url],
+                    &[
+                        &"default-comment-moderation",
+                        &config.public_site_url,
+                        &(DEFAULT_COMMENT_MIN_INTERVAL_SECONDS as i32),
+                        &(DEFAULT_COMMENT_PER_ARTICLE_WINDOW_MINUTES as i32),
+                        &(DEFAULT_COMMENT_PER_ARTICLE_EMAIL_MAX as i32),
+                        &(DEFAULT_COMMENT_PER_ARTICLE_IP_MAX as i32),
+                        &(DEFAULT_COMMENT_GLOBAL_WINDOW_MINUTES as i32),
+                        &(DEFAULT_COMMENT_GLOBAL_EMAIL_MAX as i32),
+                        &(DEFAULT_COMMENT_GLOBAL_IP_MAX as i32),
+                    ],
                 )
                 .map_err(db_error)?;
         }
@@ -602,9 +706,27 @@ impl<'a> Database<'a> {
                     low_risk_max_score INTEGER NOT NULL DEFAULT 35,
                     high_risk_min_score INTEGER NOT NULL DEFAULT 80,
                     blocked_keywords_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    rate_limit_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    rate_limit_min_interval_seconds INTEGER NOT NULL DEFAULT 8,
+                    rate_limit_per_article_window_minutes INTEGER NOT NULL DEFAULT 10,
+                    rate_limit_per_article_email_max INTEGER NOT NULL DEFAULT 3,
+                    rate_limit_per_article_ip_max INTEGER NOT NULL DEFAULT 0,
+                    rate_limit_global_window_minutes INTEGER NOT NULL DEFAULT 60,
+                    rate_limit_global_email_max INTEGER NOT NULL DEFAULT 15,
+                    rate_limit_global_ip_max INTEGER NOT NULL DEFAULT 60,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+
+                ALTER TABLE comment_moderation_configs
+                    ADD COLUMN IF NOT EXISTS rate_limit_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    ADD COLUMN IF NOT EXISTS rate_limit_min_interval_seconds INTEGER NOT NULL DEFAULT 8,
+                    ADD COLUMN IF NOT EXISTS rate_limit_per_article_window_minutes INTEGER NOT NULL DEFAULT 10,
+                    ADD COLUMN IF NOT EXISTS rate_limit_per_article_email_max INTEGER NOT NULL DEFAULT 3,
+                    ADD COLUMN IF NOT EXISTS rate_limit_per_article_ip_max INTEGER NOT NULL DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS rate_limit_global_window_minutes INTEGER NOT NULL DEFAULT 60,
+                    ADD COLUMN IF NOT EXISTS rate_limit_global_email_max INTEGER NOT NULL DEFAULT 15,
+                    ADD COLUMN IF NOT EXISTS rate_limit_global_ip_max INTEGER NOT NULL DEFAULT 60;
 
                 ALTER TABLE comments
                     ADD COLUMN IF NOT EXISTS moderation_risk_level TEXT,
@@ -752,6 +874,7 @@ impl<'a> Database<'a> {
         &mut self,
         article_id: &str,
         input: CreateCommentInput,
+        moderation_config: &InternalCommentModerationConfig,
         ip: Option<String>,
         user_agent: Option<String>,
     ) -> Result<MutationResult, ApiError> {
@@ -791,7 +914,12 @@ impl<'a> Database<'a> {
             ));
         }
 
-        self.enforce_public_comment_rate_limit(article_id, &email, ip.as_deref())?;
+        self.enforce_public_comment_rate_limit(
+            article_id,
+            &email,
+            ip.as_deref(),
+            moderation_config,
+        )?;
 
         if let Some(website) = website.as_ref() {
             require_length(
@@ -1568,9 +1696,50 @@ impl<'a> Database<'a> {
             .blocked_keywords
             .map(normalize_comment_blocked_keywords)
             .unwrap_or(current.blocked_keywords);
+        let rate_limit_enabled = input
+            .rate_limit_enabled
+            .unwrap_or(current.rate_limit_enabled);
+        let rate_limit_min_interval_seconds = input
+            .rate_limit_min_interval_seconds
+            .unwrap_or(current.rate_limit_min_interval_seconds);
+        let rate_limit_per_article_window_minutes = input
+            .rate_limit_per_article_window_minutes
+            .unwrap_or(current.rate_limit_per_article_window_minutes);
+        let rate_limit_per_article_email_max = input
+            .rate_limit_per_article_email_max
+            .unwrap_or(current.rate_limit_per_article_email_max);
+        let rate_limit_per_article_ip_max = input
+            .rate_limit_per_article_ip_max
+            .unwrap_or(current.rate_limit_per_article_ip_max);
+        let rate_limit_global_window_minutes = input
+            .rate_limit_global_window_minutes
+            .unwrap_or(current.rate_limit_global_window_minutes);
+        let rate_limit_global_email_max = input
+            .rate_limit_global_email_max
+            .unwrap_or(current.rate_limit_global_email_max);
+        let rate_limit_global_ip_max = input
+            .rate_limit_global_ip_max
+            .unwrap_or(current.rate_limit_global_ip_max);
 
         let (low_risk_max_score, high_risk_min_score) =
             normalize_comment_moderation_thresholds(low_risk_max_score, high_risk_min_score);
+        let (
+            rate_limit_min_interval_seconds,
+            rate_limit_per_article_window_minutes,
+            rate_limit_per_article_email_max,
+            rate_limit_per_article_ip_max,
+            rate_limit_global_window_minutes,
+            rate_limit_global_email_max,
+            rate_limit_global_ip_max,
+        ) = normalize_comment_rate_limit_settings(
+            rate_limit_min_interval_seconds,
+            rate_limit_per_article_window_minutes,
+            rate_limit_per_article_email_max,
+            rate_limit_per_article_ip_max,
+            rate_limit_global_window_minutes,
+            rate_limit_global_email_max,
+            rate_limit_global_ip_max,
+        );
         let blocked_keywords_json = serialize_json_value(&blocked_keywords)?;
         let safe_provider = if ai_provider == "openai" {
             ai_provider
@@ -1590,8 +1759,11 @@ impl<'a> Database<'a> {
                      ai_enabled = $6, ai_provider = $7, ai_api_key = $8, ai_model = $9,
                      auto_approve_low_risk = $10, auto_reject_high_risk = $11,
                      low_risk_max_score = $12, high_risk_min_score = $13, blocked_keywords_json = $14::jsonb,
+                     rate_limit_enabled = $15, rate_limit_min_interval_seconds = $16,
+                     rate_limit_per_article_window_minutes = $17, rate_limit_per_article_email_max = $18, rate_limit_per_article_ip_max = $19,
+                     rate_limit_global_window_minutes = $20, rate_limit_global_email_max = $21, rate_limit_global_ip_max = $22,
                      updated_at = NOW()
-                 WHERE id = $15",
+                 WHERE id = $23",
                 &[
                     &enabled,
                     &akismet_enabled,
@@ -1607,6 +1779,14 @@ impl<'a> Database<'a> {
                     &low_risk_max_score,
                     &high_risk_min_score,
                     &blocked_keywords_json,
+                    &rate_limit_enabled,
+                    &rate_limit_min_interval_seconds,
+                    &rate_limit_per_article_window_minutes,
+                    &rate_limit_per_article_email_max,
+                    &rate_limit_per_article_ip_max,
+                    &rate_limit_global_window_minutes,
+                    &rate_limit_global_email_max,
+                    &rate_limit_global_ip_max,
                     &"default-comment-moderation",
                 ],
             )

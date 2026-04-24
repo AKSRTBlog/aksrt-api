@@ -600,6 +600,14 @@ struct InternalCommentModerationConfig {
     low_risk_max_score: i32,
     high_risk_min_score: i32,
     blocked_keywords: Vec<String>,
+    rate_limit_enabled: bool,
+    rate_limit_min_interval_seconds: i32,
+    rate_limit_per_article_window_minutes: i32,
+    rate_limit_per_article_email_max: i32,
+    rate_limit_per_article_ip_max: i32,
+    rate_limit_global_window_minutes: i32,
+    rate_limit_global_email_max: i32,
+    rate_limit_global_ip_max: i32,
 }
 
 #[derive(Clone)]
@@ -825,6 +833,14 @@ struct CommentModerationAdminConfigItem {
     low_risk_max_score: i32,
     high_risk_min_score: i32,
     blocked_keywords: Vec<String>,
+    rate_limit_enabled: bool,
+    rate_limit_min_interval_seconds: i32,
+    rate_limit_per_article_window_minutes: i32,
+    rate_limit_per_article_email_max: i32,
+    rate_limit_per_article_ip_max: i32,
+    rate_limit_global_window_minutes: i32,
+    rate_limit_global_email_max: i32,
+    rate_limit_global_ip_max: i32,
 }
 
 #[derive(Deserialize)]
@@ -935,6 +951,14 @@ struct UpdateCommentModerationConfigInput {
     low_risk_max_score: Option<i32>,
     high_risk_min_score: Option<i32>,
     blocked_keywords: Option<Vec<String>>,
+    rate_limit_enabled: Option<bool>,
+    rate_limit_min_interval_seconds: Option<i32>,
+    rate_limit_per_article_window_minutes: Option<i32>,
+    rate_limit_per_article_email_max: Option<i32>,
+    rate_limit_per_article_ip_max: Option<i32>,
+    rate_limit_global_window_minutes: Option<i32>,
+    rate_limit_global_email_max: Option<i32>,
+    rate_limit_global_ip_max: Option<i32>,
 }
 
 #[derive(Serialize, Clone)]
@@ -3108,6 +3132,34 @@ fn normalize_comment_moderation_thresholds(
     (low, high)
 }
 
+fn normalize_comment_rate_limit_settings(
+    min_interval_seconds: i32,
+    per_article_window_minutes: i32,
+    per_article_email_max: i32,
+    per_article_ip_max: i32,
+    global_window_minutes: i32,
+    global_email_max: i32,
+    global_ip_max: i32,
+) -> (i32, i32, i32, i32, i32, i32, i32) {
+    let normalized_min_interval_seconds = min_interval_seconds.clamp(0, 3600);
+    let normalized_per_article_window_minutes = per_article_window_minutes.clamp(0, 24 * 60);
+    let normalized_per_article_email_max = per_article_email_max.clamp(0, 500);
+    let normalized_per_article_ip_max = per_article_ip_max.clamp(0, 1000);
+    let normalized_global_window_minutes = global_window_minutes.clamp(0, 24 * 60);
+    let normalized_global_email_max = global_email_max.clamp(0, 2000);
+    let normalized_global_ip_max = global_ip_max.clamp(0, 5000);
+
+    (
+        normalized_min_interval_seconds,
+        normalized_per_article_window_minutes,
+        normalized_per_article_email_max,
+        normalized_per_article_ip_max,
+        normalized_global_window_minutes,
+        normalized_global_email_max,
+        normalized_global_ip_max,
+    )
+}
+
 fn read_internal_comment_moderation_config(
     conn: &mut PgClient,
     fallback_site_url: &str,
@@ -3116,7 +3168,10 @@ fn read_internal_comment_moderation_config(
         .query_opt(
             "SELECT enabled, akismet_enabled, akismet_api_key, akismet_site_url, akismet_blog_lang,
                     ai_enabled, ai_provider, ai_api_key, ai_model, auto_approve_low_risk, auto_reject_high_risk,
-                    low_risk_max_score, high_risk_min_score, blocked_keywords_json::text
+                    low_risk_max_score, high_risk_min_score, blocked_keywords_json::text,
+                    rate_limit_enabled, rate_limit_min_interval_seconds,
+                    rate_limit_per_article_window_minutes, rate_limit_per_article_email_max, rate_limit_per_article_ip_max,
+                    rate_limit_global_window_minutes, rate_limit_global_email_max, rate_limit_global_ip_max
              FROM comment_moderation_configs
              WHERE id = $1",
             &[&"default-comment-moderation"],
@@ -3147,6 +3202,14 @@ fn read_internal_comment_moderation_config(
                 low_risk_max_score: row.get(11),
                 high_risk_min_score: row.get(12),
                 blocked_keywords,
+                rate_limit_enabled: row.get(14),
+                rate_limit_min_interval_seconds: row.get(15),
+                rate_limit_per_article_window_minutes: row.get(16),
+                rate_limit_per_article_email_max: row.get(17),
+                rate_limit_per_article_ip_max: row.get(18),
+                rate_limit_global_window_minutes: row.get(19),
+                rate_limit_global_email_max: row.get(20),
+                rate_limit_global_ip_max: row.get(21),
             }
         })
         .unwrap_or(InternalCommentModerationConfig {
@@ -3164,6 +3227,14 @@ fn read_internal_comment_moderation_config(
             low_risk_max_score: 35,
             high_risk_min_score: 80,
             blocked_keywords: Vec::new(),
+            rate_limit_enabled: true,
+            rate_limit_min_interval_seconds: 8,
+            rate_limit_per_article_window_minutes: 10,
+            rate_limit_per_article_email_max: 3,
+            rate_limit_per_article_ip_max: 0,
+            rate_limit_global_window_minutes: 60,
+            rate_limit_global_email_max: 15,
+            rate_limit_global_ip_max: 60,
         });
 
     if !validate_url(config.akismet_site_url.trim()) {
@@ -3188,6 +3259,30 @@ fn read_internal_comment_moderation_config(
     );
     config.low_risk_max_score = low;
     config.high_risk_min_score = high;
+    let (
+        min_interval_seconds,
+        per_article_window_minutes,
+        per_article_email_max,
+        per_article_ip_max,
+        global_window_minutes,
+        global_email_max,
+        global_ip_max,
+    ) = normalize_comment_rate_limit_settings(
+        config.rate_limit_min_interval_seconds,
+        config.rate_limit_per_article_window_minutes,
+        config.rate_limit_per_article_email_max,
+        config.rate_limit_per_article_ip_max,
+        config.rate_limit_global_window_minutes,
+        config.rate_limit_global_email_max,
+        config.rate_limit_global_ip_max,
+    );
+    config.rate_limit_min_interval_seconds = min_interval_seconds;
+    config.rate_limit_per_article_window_minutes = per_article_window_minutes;
+    config.rate_limit_per_article_email_max = per_article_email_max;
+    config.rate_limit_per_article_ip_max = per_article_ip_max;
+    config.rate_limit_global_window_minutes = global_window_minutes;
+    config.rate_limit_global_email_max = global_email_max;
+    config.rate_limit_global_ip_max = global_ip_max;
 
     Ok(config)
 }
@@ -3211,6 +3306,14 @@ fn to_comment_moderation_admin_config_item(
         low_risk_max_score: config.low_risk_max_score,
         high_risk_min_score: config.high_risk_min_score,
         blocked_keywords: config.blocked_keywords,
+        rate_limit_enabled: config.rate_limit_enabled,
+        rate_limit_min_interval_seconds: config.rate_limit_min_interval_seconds,
+        rate_limit_per_article_window_minutes: config.rate_limit_per_article_window_minutes,
+        rate_limit_per_article_email_max: config.rate_limit_per_article_email_max,
+        rate_limit_per_article_ip_max: config.rate_limit_per_article_ip_max,
+        rate_limit_global_window_minutes: config.rate_limit_global_window_minutes,
+        rate_limit_global_email_max: config.rate_limit_global_email_max,
+        rate_limit_global_ip_max: config.rate_limit_global_ip_max,
     }
 }
 
@@ -4732,6 +4835,7 @@ async fn submit_public_comment(
         let created = Database::new(&mut conn).create_public_comment(
             &article.id,
             input.clone(),
+            &moderation_config,
             ip.clone(),
             user_agent.clone(),
         )?;
@@ -7757,4 +7861,5 @@ mod tests {
         assert_eq!(parsed.1, "comment-2");
         assert_eq!(parsed.2, expires_at);
     }
+
 }

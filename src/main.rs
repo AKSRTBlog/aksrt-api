@@ -2,7 +2,7 @@ use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc, 
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -302,6 +302,8 @@ struct CommentRecord {
     email: String,
     content: String,
     status: String,
+    ip: Option<String>,
+    user_agent: Option<String>,
     created_at: String,
 }
 
@@ -313,6 +315,8 @@ struct PublicCommentItem {
     nickname: String,
     avatar_url: String,
     content: String,
+    ip: Option<String>,
+    browser_label: String,
     created_at: String,
     replies: Vec<PublicCommentItem>,
 }
@@ -961,6 +965,13 @@ struct UpdateCommentModerationConfigInput {
     rate_limit_global_ip_max: Option<i32>,
 }
 
+#[derive(Clone)]
+struct CommentClientMeta {
+    ip: Option<String>,
+    user_agent: Option<String>,
+    referrer: Option<String>,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct CommentModerationAkismetResult {
@@ -1172,6 +1183,8 @@ struct AdminCommentItem {
     website: Option<String>,
     content: String,
     status: String,
+    ip: Option<String>,
+    user_agent: Option<String>,
     reviewed_by: Option<String>,
     reviewed_at: Option<String>,
     reject_reason: Option<String>,
@@ -1620,7 +1633,9 @@ async fn main() {
         .await
         .expect("failed to bind listener");
 
-    axum::serve(listener, app).await.expect("server error");
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .await
+        .expect("server error");
 }
 
 async fn health() -> impl IntoResponse {
@@ -1956,22 +1971,144 @@ fn validate_contact_url(value: &str) -> bool {
     }
 }
 
-fn extract_client_meta(headers: &HeaderMap) -> (Option<String>, Option<String>) {
-    let ip = headers
-        .get("x-forwarded-for")
-        .or_else(|| headers.get("x-real-ip"))
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.split(',').next().unwrap_or(value).trim().to_string())
-        .filter(|value| !value.is_empty());
+fn normalize_header_text(value: &str, max_chars: usize) -> Option<String> {
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect::<String>();
 
-    let user_agent = headers
-        .get(axum::http::header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-
-    (ip, user_agent)
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
+
+fn header_text(headers: &HeaderMap, name: &str, max_chars: usize) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| normalize_header_text(value, max_chars))
+}
+
+fn parse_forwarded_for_header(value: &str) -> Option<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .find(|candidate| !candidate.is_empty() && !candidate.eq_ignore_ascii_case("unknown"))
+        .and_then(|candidate| normalize_header_text(candidate.trim_matches('"'), 128))
+}
+
+fn parse_forwarded_header(value: &str) -> Option<String> {
+    value.split(',').find_map(|entry| {
+        entry.split(';').find_map(|part| {
+            let (name, candidate) = part.trim().split_once('=')?;
+            if !name.trim().eq_ignore_ascii_case("for") {
+                return None;
+            }
+            let cleaned = candidate
+                .trim()
+                .trim_matches('"')
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            normalize_header_text(cleaned, 128)
+        })
+    })
+}
+
+fn extract_client_ip(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> Option<String> {
+    for name in [
+        "cf-connecting-ip",
+        "true-client-ip",
+        "x-real-ip",
+        "x-client-ip",
+        "x-forwarded-for",
+    ] {
+        if let Some(raw) = headers.get(name).and_then(|value| value.to_str().ok()) {
+            if let Some(ip) = parse_forwarded_for_header(raw) {
+                return Some(ip);
+            }
+        }
+    }
+
+    headers
+        .get("forwarded")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_forwarded_header)
+        .or_else(|| peer_addr.map(|addr| addr.ip().to_string()))
+}
+
+fn extract_comment_client_meta(
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+) -> CommentClientMeta {
+    CommentClientMeta {
+        ip: extract_client_ip(headers, peer_addr),
+        user_agent: header_text(headers, axum::http::header::USER_AGENT.as_str(), 512),
+        referrer: header_text(headers, axum::http::header::REFERER.as_str(), 1024),
+    }
+}
+
+fn extract_client_meta(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    let meta = extract_comment_client_meta(headers, None);
+    (meta.ip, meta.user_agent)
+}
+
+fn extract_user_agent_version(user_agent: &str, token: &str) -> Option<String> {
+    let start = user_agent.find(token)? + token.len();
+    let version = user_agent[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect::<String>();
+
+    if version.is_empty() {
+        None
+    } else {
+        version.split('.').next().map(|major| major.to_string())
+    }
+}
+
+fn detect_comment_browser_label(user_agent: Option<&str>) -> String {
+    let Some(user_agent) = user_agent.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "Unknown browser".to_string();
+    };
+
+    let lower = user_agent.to_ascii_lowercase();
+    let browser = if lower.contains("edg/") {
+        ("Edge", extract_user_agent_version(user_agent, "Edg/"))
+    } else if lower.contains("opr/") || lower.contains("opera/") {
+        (
+            "Opera",
+            extract_user_agent_version(user_agent, "OPR/")
+                .or_else(|| extract_user_agent_version(user_agent, "Opera/")),
+        )
+    } else if lower.contains("firefox/") {
+        ("Firefox", extract_user_agent_version(user_agent, "Firefox/"))
+    } else if lower.contains("crios/") {
+        ("Chrome iOS", extract_user_agent_version(user_agent, "CriOS/"))
+    } else if lower.contains("chrome/") || lower.contains("chromium/") {
+        (
+            "Chrome",
+            extract_user_agent_version(user_agent, "Chrome/")
+                .or_else(|| extract_user_agent_version(user_agent, "Chromium/")),
+        )
+    } else if lower.contains("safari/") && lower.contains("version/") {
+        ("Safari", extract_user_agent_version(user_agent, "Version/"))
+    } else if lower.contains("msie ") || lower.contains("trident/") {
+        ("Internet Explorer", None)
+    } else {
+        ("Unknown browser", None)
+    };
+
+    match browser.1 {
+        Some(version) if !version.is_empty() => format!("{} {}", browser.0, version),
+        _ => browser.0.to_string(),
+    }
+}
+
 
 fn hex_lower(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -3485,8 +3622,7 @@ fn run_akismet_comment_check(
     config: &InternalCommentModerationConfig,
     article: &ArticleRow,
     input: &CreateCommentInput,
-    ip: Option<&str>,
-    user_agent: Option<&str>,
+    client_meta: &CommentClientMeta,
     public_site_url: &str,
 ) -> CommentModerationAkismetResult {
     if !config.akismet_enabled {
@@ -3523,6 +3659,7 @@ fn run_akismet_comment_check(
     let mut form = vec![
         ("blog", blog),
         ("blog_lang", config.akismet_blog_lang.trim().to_string()),
+        ("blog_charset", "UTF-8".to_string()),
         ("comment_type", "comment".to_string()),
         ("comment_author", input.nickname.trim().to_string()),
         ("comment_author_email", input.email.trim().to_string()),
@@ -3532,17 +3669,25 @@ fn run_akismet_comment_check(
         ),
         ("comment_content", input.content.trim().to_string()),
         ("permalink", permalink),
+        ("comment_date_gmt", Utc::now().to_rfc3339()),
+        ("comment_post_modified_gmt", article.updated_at.clone()),
     ];
 
-    if let Some(value) = ip {
+    if let Some(value) = client_meta.ip.as_deref() {
         if !value.trim().is_empty() {
             form.push(("user_ip", value.trim().to_string()));
         }
     }
 
-    if let Some(value) = user_agent {
+    if let Some(value) = client_meta.user_agent.as_deref() {
         if !value.trim().is_empty() {
             form.push(("user_agent", value.trim().to_string()));
+        }
+    }
+
+    if let Some(value) = client_meta.referrer.as_deref() {
+        if !value.trim().is_empty() {
+            form.push(("referrer", value.trim().to_string()));
         }
     }
 
@@ -3788,8 +3933,7 @@ fn evaluate_comment_moderation(
     config: &InternalCommentModerationConfig,
     article: &ArticleRow,
     input: &CreateCommentInput,
-    ip: Option<&str>,
-    user_agent: Option<&str>,
+    client_meta: &CommentClientMeta,
     public_site_url: &str,
 ) -> CommentModerationOutcome {
     if !config.enabled {
@@ -3832,7 +3976,7 @@ fn evaluate_comment_moderation(
     }
 
     let akismet_result =
-        run_akismet_comment_check(config, article, input, ip, user_agent, public_site_url);
+        run_akismet_comment_check(config, article, input, client_meta, public_site_url);
     if akismet_result.enabled {
         score += akismet_result.score;
         reasons.push(akismet_result.note.clone());
@@ -3892,6 +4036,64 @@ fn evaluate_comment_moderation(
             None
         },
     }
+}
+
+fn spawn_comment_moderation_task(
+    database_url: String,
+    public_site_url: String,
+    comment_id: String,
+    article: ArticleRow,
+    input: CreateCommentInput,
+    client_meta: CommentClientMeta,
+    notification: PendingCommentNotification,
+) {
+    tokio::spawn(async move {
+        let comment_id_for_log = comment_id.clone();
+        let task_result = tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
+            let mut conn = PgClient::connect(&database_url, NoTls).map_err(db_error)?;
+            let moderation_config =
+                read_internal_comment_moderation_config(&mut conn, &public_site_url)?;
+            let moderation = evaluate_comment_moderation(
+                &moderation_config,
+                &article,
+                &input,
+                &client_meta,
+                &public_site_url,
+            );
+            let final_result =
+                Database::new(&mut conn).apply_comment_moderation_outcome(&comment_id, moderation)?;
+
+            if final_result.status == "pending" {
+                let mut notification = notification;
+                notification.status = final_result.status;
+                try_send_pending_comment_notification(
+                    &mut conn,
+                    &public_site_url,
+                    &article,
+                    &notification,
+                );
+            }
+
+            Ok(())
+        })
+        .await;
+
+        match task_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!(
+                    "Async comment moderation failed for comment {}: [{}] {}",
+                    comment_id_for_log, error.code, error.message
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "Async comment moderation task failed for comment {}: {}",
+                    comment_id_for_log, error
+                );
+            }
+        }
+    });
 }
 
 fn preview_captcha_value(value: &str) -> String {
@@ -4808,12 +5010,16 @@ async fn list_public_comments(
 
 async fn submit_public_comment(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     Path(slug): Path<String>,
     headers: HeaderMap,
     Json(input): Json<CreateCommentInput>,
 ) -> Result<impl IntoResponse, ApiError> {
     let public_site_url = state.config.public_site_url.clone();
     let database_url = state.config.database_url.clone();
+    let client_meta = extract_comment_client_meta(&headers, Some(peer_addr));
+    let input_for_moderation = input.clone();
+    let client_meta_for_moderation = client_meta.clone();
     let result = run_blocking(move || {
         let mut conn = open_connection(&state)?;
         let article =
@@ -4821,7 +5027,7 @@ async fn submit_public_comment(
         validate_geetest_captcha(&state, &mut conn, "comment", input.captcha.as_ref())?;
         let moderation_config =
             read_internal_comment_moderation_config(&mut conn, &state.config.public_site_url)?;
-        let mut notification = PendingCommentNotification {
+        let notification = PendingCommentNotification {
             article_title: article.title.clone(),
             article_slug: article.slug.clone(),
             nickname: input.nickname.trim().to_string(),
@@ -4831,29 +5037,15 @@ async fn submit_public_comment(
             parent_id: input.parent_id.clone(),
             status: "pending".to_string(),
         };
-        let (ip, user_agent) = extract_client_meta(&headers);
         let created = Database::new(&mut conn).create_public_comment(
             &article.id,
-            input.clone(),
+            input,
             &moderation_config,
-            ip.clone(),
-            user_agent.clone(),
+            client_meta.ip.clone(),
+            client_meta.user_agent.clone(),
         )?;
-        let moderation = evaluate_comment_moderation(
-            &moderation_config,
-            &article,
-            &input,
-            ip.as_deref(),
-            user_agent.as_deref(),
-            &state.config.public_site_url,
-        );
-        let final_result = Database::new(&mut conn).apply_comment_moderation_outcome(
-            &created.id,
-            moderation,
-        )?;
-        notification.status = final_result.status.clone();
 
-        Ok((final_result, article, notification))
+        Ok((created, article, notification))
     })
     .await?;
 
@@ -4867,22 +5059,15 @@ async fn submit_public_comment(
     );
     let article_for_notification = article.clone();
     let notification = notification.clone();
-    if notification.status == "pending" {
-        tokio::spawn(async move {
-            tokio::task::spawn_blocking(move || {
-                if let Ok(mut conn) = PgClient::connect(&database_url, NoTls) {
-                    try_send_pending_comment_notification(
-                        &mut conn,
-                        &public_site_url,
-                        &article_for_notification,
-                        &notification,
-                    );
-                }
-            })
-            .await
-            .ok();
-        });
-    }
+    spawn_comment_moderation_task(
+        database_url,
+        public_site_url,
+        comment_result.id.clone(),
+        article_for_notification,
+        input_for_moderation,
+        client_meta_for_moderation,
+        notification,
+    );
 
     Ok(created(PublicCommentSubmissionResult {
         id: comment_result.id.clone(),
@@ -5709,7 +5894,7 @@ fn load_admin_comment_items(conn: &mut PgClient) -> Result<Vec<AdminCommentItem>
     let rows = conn
         .query(
             "SELECT c.id, c.article_id, a.title, a.slug, c.parent_id, c.nickname, c.email, c.website, c.content, c.status,
-                    c.reviewed_by, c.reviewed_at::text, c.reject_reason,
+                    c.ip, c.user_agent, c.reviewed_by, c.reviewed_at::text, c.reject_reason,
                     c.moderation_risk_level, c.moderation_risk_score, c.moderation_summary,
                     c.moderation_akismet_json::text, c.moderation_ai_json::text, c.moderation_pipeline_version,
                     c.created_at::text, c.updated_at::text
@@ -5755,17 +5940,19 @@ fn load_admin_comment_items(conn: &mut PgClient) -> Result<Vec<AdminCommentItem>
                 website: row.get(7),
                 content: row.get(8),
                 status: row.get(9),
-                reviewed_by: row.get(10),
-                reviewed_at: row.get(11),
-                reject_reason: row.get(12),
-                moderation_risk_level: row.get(13),
-                moderation_risk_score: row.get(14),
-                moderation_summary: row.get(15),
-                moderation_akismet_raw: row.get(16),
-                moderation_ai_raw: row.get(17),
-                moderation_pipeline_version: row.get(18),
-                created_at: row.get(19),
-                updated_at: row.get(20),
+                ip: row.get(10),
+                user_agent: row.get(11),
+                reviewed_by: row.get(12),
+                reviewed_at: row.get(13),
+                reject_reason: row.get(14),
+                moderation_risk_level: row.get(15),
+                moderation_risk_score: row.get(16),
+                moderation_summary: row.get(17),
+                moderation_akismet_raw: row.get(18),
+                moderation_ai_raw: row.get(19),
+                moderation_pipeline_version: row.get(20),
+                created_at: row.get(21),
+                updated_at: row.get(22),
             }
         })
         .collect())
@@ -7540,7 +7727,7 @@ fn load_public_comments(
 ) -> Result<Vec<PublicCommentItem>, ApiError> {
     let rows = conn
         .query(
-            "SELECT id, article_id, parent_id, nickname, email, content, status, created_at::text
+            "SELECT id, article_id, parent_id, nickname, email, content, status, ip, user_agent, created_at::text
              FROM comments
              WHERE article_id = $1 AND status = 'approved'
              ORDER BY created_at ASC",
@@ -7556,7 +7743,9 @@ fn load_public_comments(
             email: row.get(4),
             content: row.get(5),
             status: row.get(6),
-            created_at: row.get(7),
+            ip: row.get(7),
+            user_agent: row.get(8),
+            created_at: row.get(9),
         })
         .collect::<Vec<_>>();
 
@@ -7571,6 +7760,8 @@ fn load_public_comments(
                 nickname: comment.nickname.clone(),
                 avatar_url: cravatar_url(&comment.email),
                 content: comment.content.clone(),
+                ip: comment.ip.clone(),
+                browser_label: detect_comment_browser_label(comment.user_agent.as_deref()),
                 created_at: comment.created_at.clone(),
                 replies: Vec::new(),
             },

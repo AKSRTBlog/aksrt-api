@@ -1837,7 +1837,8 @@ impl<'a> Database<'a> {
                      moderation_ai_json = $8::jsonb,
                      moderation_pipeline_version = $9,
                      updated_at = NOW()
-                 WHERE id = $10",
+                 WHERE id = $10
+                   AND (status = 'pending' OR reviewed_by = 'system-moderation')",
                 &[
                     &outcome.status,
                     &reviewed_by,
@@ -1854,11 +1855,23 @@ impl<'a> Database<'a> {
             .map_err(db_error)?;
 
         if updated == 0 {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                "COMMENT_NOT_FOUND",
-                "Comment was not found",
-            ));
+            let current_status = self
+                .conn
+                .query_opt("SELECT status FROM comments WHERE id = $1", &[&comment_id])
+                .map_err(db_error)?
+                .map(|row| row.get::<usize, String>(0));
+
+            return match current_status {
+                Some(status) => Ok(MutationResult {
+                    id: comment_id.to_string(),
+                    status,
+                }),
+                None => Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "COMMENT_NOT_FOUND",
+                    "Comment was not found",
+                )),
+            };
         }
 
         Ok(MutationResult {

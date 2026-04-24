@@ -1,6 +1,14 @@
-# 二进制文件 (由 CI/CD 或本地编译生成)
+# Compiled binaries from local builds
 aksrtblog-rust-api
 
-# 编译产物
+# Rust build artifacts
 target/
 target-*/
+
+# Files that don't affect the container image
+.git
+.gitignore
+README.md
+data/
+.env
+.env.*

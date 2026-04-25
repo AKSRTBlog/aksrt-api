@@ -550,6 +550,7 @@ impl<'a> Database<'a> {
                     "INSERT INTO comment_moderation_configs (
                         id, enabled, akismet_enabled, akismet_api_key, akismet_site_url, akismet_blog_lang,
                         ai_enabled, ai_provider, ai_api_key, ai_model,
+                        ai_base_url, azure_deployment_id, azure_api_version,
                         auto_approve_low_risk, auto_reject_high_risk,
                         low_risk_max_score, high_risk_min_score, blocked_keywords_json,
                         rate_limit_enabled, rate_limit_min_interval_seconds,
@@ -560,6 +561,7 @@ impl<'a> Database<'a> {
                      ) VALUES (
                         $1, TRUE, FALSE, '', $2, 'zh-CN',
                         FALSE, 'openai', '', 'omni-moderation-latest',
+                        '', '', '2023-09-01-preview',
                         TRUE, TRUE,
                         35, 80, '[]'::jsonb,
                         TRUE, $3, $4, $5, $6, $7, $8, $9,
@@ -696,6 +698,9 @@ impl<'a> Database<'a> {
                     ai_provider TEXT NOT NULL DEFAULT 'openai',
                     ai_api_key TEXT NOT NULL DEFAULT '',
                     ai_model TEXT NOT NULL DEFAULT 'omni-moderation-latest',
+                    ai_base_url TEXT NOT NULL DEFAULT '',
+                    azure_deployment_id TEXT NOT NULL DEFAULT '',
+                    azure_api_version TEXT NOT NULL DEFAULT '2023-09-01-preview',
                     auto_approve_low_risk BOOLEAN NOT NULL DEFAULT TRUE,
                     auto_reject_high_risk BOOLEAN NOT NULL DEFAULT TRUE,
                     low_risk_max_score INTEGER NOT NULL DEFAULT 35,
@@ -727,7 +732,10 @@ impl<'a> Database<'a> {
                     ADD COLUMN IF NOT EXISTS rate_limit_global_ip_max INTEGER NOT NULL DEFAULT 60,
                     ADD COLUMN IF NOT EXISTS geoip_enabled BOOLEAN NOT NULL DEFAULT TRUE,
                     ADD COLUMN IF NOT EXISTS geoip_provider TEXT NOT NULL DEFAULT 'ipapi',
-                    ADD COLUMN IF NOT EXISTS geoip_api_key TEXT NOT NULL DEFAULT '';
+                    ADD COLUMN IF NOT EXISTS geoip_api_key TEXT NOT NULL DEFAULT '',
+                    ADD COLUMN IF NOT EXISTS ai_base_url TEXT NOT NULL DEFAULT '',
+                    ADD COLUMN IF NOT EXISTS azure_deployment_id TEXT NOT NULL DEFAULT '',
+                    ADD COLUMN IF NOT EXISTS azure_api_version TEXT NOT NULL DEFAULT '2023-09-01-preview';
 
                 ALTER TABLE comments
                     ADD COLUMN IF NOT EXISTS country_name TEXT,
@@ -1674,6 +1682,21 @@ impl<'a> Database<'a> {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .unwrap_or(current.ai_model);
+        let ai_base_url = input
+            .ai_base_url
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.ai_base_url);
+        let azure_deployment_id = input
+            .azure_deployment_id
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.azure_deployment_id);
+        let azure_api_version = input
+            .azure_api_version
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| current.azure_api_version.clone().unwrap_or_else(|| "2023-09-01-preview".to_string()));
 
         let auto_approve_low_risk = input
             .auto_approve_low_risk
@@ -1760,19 +1783,23 @@ impl<'a> Database<'a> {
             verify_akismet_api_key(&akismet_api_key, &safe_site_url)?;
         }
 
+        // Normalize provider - allow openai/azure/custom (no longer force to openai)
+        let safe_provider = normalize_ai_provider(&ai_provider);
+
         self.conn
             .execute(
                 "UPDATE comment_moderation_configs
                  SET enabled = $1, akismet_enabled = $2, akismet_api_key = $3, akismet_site_url = $4, akismet_blog_lang = $5,
                      ai_enabled = $6, ai_provider = $7, ai_api_key = $8, ai_model = $9,
-                     auto_approve_low_risk = $10, auto_reject_high_risk = $11,
-                     low_risk_max_score = $12, high_risk_min_score = $13, blocked_keywords_json = $14::jsonb,
-                     rate_limit_enabled = $15, rate_limit_min_interval_seconds = $16,
-                     rate_limit_per_article_window_minutes = $17, rate_limit_per_article_email_max = $18, rate_limit_per_article_ip_max = $19,
-                     rate_limit_global_window_minutes = $20, rate_limit_global_email_max = $21, rate_limit_global_ip_max = $22,
-                     geoip_enabled = $23, geoip_provider = $24, geoip_api_key = $25,
+                     ai_base_url = $10, azure_deployment_id = $11, azure_api_version = $12,
+                     auto_approve_low_risk = $13, auto_reject_high_risk = $14,
+                     low_risk_max_score = $15, high_risk_min_score = $16, blocked_keywords_json = $17::jsonb,
+                     rate_limit_enabled = $18, rate_limit_min_interval_seconds = $19,
+                     rate_limit_per_article_window_minutes = $20, rate_limit_per_article_email_max = $21, rate_limit_per_article_ip_max = $22,
+                     rate_limit_global_window_minutes = $23, rate_limit_global_email_max = $24, rate_limit_global_ip_max = $25,
+                     geoip_enabled = $26, geoip_provider = $27, geoip_api_key = $28,
                      updated_at = NOW()
-                 WHERE id = $26",
+                 WHERE id = $29",
                 &[
                     &enabled,
                     &akismet_enabled,
@@ -1783,6 +1810,9 @@ impl<'a> Database<'a> {
                     &safe_provider,
                     &ai_api_key,
                     &ai_model,
+                    &ai_base_url,
+                    &azure_deployment_id,
+                    &azure_api_version,
                     &auto_approve_low_risk,
                     &auto_reject_high_risk,
                     &low_risk_max_score,
@@ -1869,7 +1899,7 @@ impl<'a> Database<'a> {
                      moderation_pipeline_version = $9,
                      updated_at = NOW()
                  WHERE id = $10
-                   AND (status = 'pending' OR reviewed_by = 'system-moderation')",
+                   AND status = 'pending'",
                 &[
                     &outcome.status,
                     &reviewed_by,

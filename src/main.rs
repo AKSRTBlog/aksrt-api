@@ -610,6 +610,9 @@ struct InternalCommentModerationConfig {
     ai_provider: String,
     ai_api_key: String,
     ai_model: String,
+    ai_base_url: String,              // Custom API base URL
+    azure_deployment_id: String,      // Azure deployment ID (for Azure provider)
+    azure_api_version: String,       // Azure API version (default: "2023-09-01-preview")
     auto_approve_low_risk: bool,
     auto_reject_high_risk: bool,
     low_risk_max_score: i32,
@@ -846,6 +849,9 @@ struct CommentModerationAdminConfigItem {
     ai_provider: String,
     ai_api_key_configured: bool,
     ai_model: String,
+    ai_base_url: String,              // Custom API base URL
+    azure_deployment_id: String,      // Azure deployment ID
+    azure_api_version: String,       // Azure API version
     auto_approve_low_risk: bool,
     auto_reject_high_risk: bool,
     low_risk_max_score: i32,
@@ -967,6 +973,9 @@ struct UpdateCommentModerationConfigInput {
     ai_provider: Option<String>,
     ai_api_key: Option<String>,
     ai_model: Option<String>,
+    ai_base_url: Option<String>,              // Custom API base URL
+    azure_deployment_id: Option<String>,      // Azure deployment ID
+    azure_api_version: Option<String>,       // Azure API version
     auto_approve_low_risk: Option<bool>,
     auto_reject_high_risk: Option<bool>,
     low_risk_max_score: Option<i32>,
@@ -1013,6 +1022,8 @@ struct CommentModerationAiResult {
     flagged: bool,
     score: i32,
     max_category_score: f64,
+    weighted_score: f64,
+    category_details: Vec<serde_json::Value>,
     flagged_categories: Vec<String>,
     note: String,
 }
@@ -1216,6 +1227,8 @@ struct AdminCommentItem {
     moderation_summary: Option<String>,
     moderation_akismet_raw: Option<String>,
     moderation_ai_raw: Option<String>,
+    moderation_ai_categories: Option<Vec<serde_json::Value>>,
+    moderation_ai_weighted_score: Option<f64>,
     moderation_pipeline_version: Option<String>,
     created_at: String,
     updated_at: String,
@@ -1541,6 +1554,10 @@ async fn main() {
         .route(
             "/api/v1/admin/site-settings/comment-moderation",
             get(admin_get_comment_moderation_config).put(admin_update_comment_moderation_config),
+        )
+        .route(
+            "/api/v1/admin/site-settings/comment-moderation/test-ai",
+            post(admin_test_ai_connection),
         )
         .route(
             "/api/v1/admin/site-settings/captcha/debug/comment",
@@ -3531,13 +3548,28 @@ fn normalize_comment_moderation_thresholds(
     let mut low = low_risk_max_score.clamp(0, 95);
     let mut high = high_risk_min_score.clamp(5, 100);
 
+    // Fix inverted or overlapping thresholds
     if low >= high {
         if high <= 5 {
-            high = 5;
-            low = 0;
+            // Both near bottom — force safe defaults
+            eprintln!(
+                "[MODERATION] WARNING: Thresholds invalid (low={} >= high={}), resetting to defaults (35/80)",
+                low, high
+            );
+            low = 35;  // Standard low-risk ceiling
+            high = 80; // Standard high-risk floor
         } else {
+            // Create minimum 5-point safety gap
             low = high - 5;
         }
+    }
+
+    // Warn on extreme configurations that make auto-decision ineffective
+    if high - low < 10 {
+        eprintln!(
+            "[MODERATION] INFO: Threshold gap is narrow ({}): most comments will be medium/pending. Consider widening.",
+            high - low
+        );
     }
 
     (low, high)
@@ -3579,6 +3611,17 @@ fn normalize_geoip_provider(provider: &str) -> String {
     }
 }
 
+/// Normalize AI provider - supports openai/azure/custom
+fn normalize_ai_provider(provider: &str) -> String {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "openai" | "official" => "openai".to_string(),
+        "azure" | "azure_openai" | "azureopenai" => "azure".to_string(),
+        "custom" | "proxy" | "forwarder" => "custom".to_string(),
+        // Default to openai for backwards compatibility
+        _ => "openai".to_string(),
+    }
+}
+
 fn read_internal_comment_moderation_config(
     conn: &mut PgClient,
     fallback_site_url: &str,
@@ -3586,7 +3629,9 @@ fn read_internal_comment_moderation_config(
     let row = conn
         .query_opt(
             "SELECT enabled, akismet_enabled, akismet_api_key, akismet_site_url, akismet_blog_lang,
-                    ai_enabled, ai_provider, ai_api_key, ai_model, auto_approve_low_risk, auto_reject_high_risk,
+                    ai_enabled, ai_provider, ai_api_key, ai_model,
+                    ai_base_url, azure_deployment_id, azure_api_version,
+                    auto_approve_low_risk, auto_reject_high_risk,
                     low_risk_max_score, high_risk_min_score, blocked_keywords_json::text,
                     rate_limit_enabled, rate_limit_min_interval_seconds,
                     rate_limit_per_article_window_minutes, rate_limit_per_article_email_max, rate_limit_per_article_ip_max,
@@ -3601,7 +3646,7 @@ fn read_internal_comment_moderation_config(
     let mut config = row
         .map(|row| {
             let blocked_keywords = row
-                .get::<usize, String>(13)
+                .get::<usize, String>(15)
                 .parse::<serde_json::Value>()
                 .ok()
                 .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
@@ -3617,22 +3662,25 @@ fn read_internal_comment_moderation_config(
                 ai_provider: row.get(6),
                 ai_api_key: row.get(7),
                 ai_model: row.get(8),
-                auto_approve_low_risk: row.get(9),
-                auto_reject_high_risk: row.get(10),
-                low_risk_max_score: row.get(11),
-                high_risk_min_score: row.get(12),
+                ai_base_url: row.get(9),
+                azure_deployment_id: row.get(10),
+                azure_api_version: row.get(11),
+                auto_approve_low_risk: row.get(12),
+                auto_reject_high_risk: row.get(13),
+                low_risk_max_score: row.get(14),
+                high_risk_min_score: row.get(15),
                 blocked_keywords,
-                rate_limit_enabled: row.get(14),
-                rate_limit_min_interval_seconds: row.get(15),
-                rate_limit_per_article_window_minutes: row.get(16),
-                rate_limit_per_article_email_max: row.get(17),
-                rate_limit_per_article_ip_max: row.get(18),
-                rate_limit_global_window_minutes: row.get(19),
-                rate_limit_global_email_max: row.get(20),
-                rate_limit_global_ip_max: row.get(21),
-                geoip_enabled: row.get(22),
-                geoip_provider: row.get(23),
-                geoip_api_key: row.get(24),
+                rate_limit_enabled: row.get(16),
+                rate_limit_min_interval_seconds: row.get(17),
+                rate_limit_per_article_window_minutes: row.get(18),
+                rate_limit_per_article_email_max: row.get(19),
+                rate_limit_per_article_ip_max: row.get(20),
+                rate_limit_global_window_minutes: row.get(21),
+                rate_limit_global_email_max: row.get(22),
+                rate_limit_global_ip_max: row.get(23),
+                geoip_enabled: row.get(24),
+                geoip_provider: row.get(25),
+                geoip_api_key: row.get(26),
             }
         })
         .unwrap_or(InternalCommentModerationConfig {
@@ -3645,6 +3693,9 @@ fn read_internal_comment_moderation_config(
             ai_provider: "openai".to_string(),
             ai_api_key: String::new(),
             ai_model: "omni-moderation-latest".to_string(),
+            ai_base_url: String::new(),
+            azure_deployment_id: String::new(),
+            azure_api_version: "2023-09-01-preview".to_string(),
             auto_approve_low_risk: true,
             auto_reject_high_risk: true,
             low_risk_max_score: 35,
@@ -3725,9 +3776,12 @@ fn to_comment_moderation_admin_config_item(
         akismet_site_url: config.akismet_site_url,
         akismet_blog_lang: config.akismet_blog_lang,
         ai_enabled: config.ai_enabled,
-        ai_provider: config.ai_provider,
+        ai_provider: config.ai_provider.clone(),
         ai_api_key_configured: !config.ai_api_key.trim().is_empty(),
-        ai_model: config.ai_model,
+        ai_model: config.ai_model.clone(),
+        ai_base_url: config.ai_base_url.clone(),
+        azure_deployment_id: config.azure_deployment_id.clone(),
+        azure_api_version: config.azure_api_version.clone(),
         auto_approve_low_risk: config.auto_approve_low_risk,
         auto_reject_high_risk: config.auto_reject_high_risk,
         low_risk_max_score: config.low_risk_max_score,
@@ -3895,24 +3949,74 @@ fn load_comment_submission_article(
     Ok(article)
 }
 
+/// Normalize content for keyword detection by removing common evasion characters.
+/// Strips: zero-width chars, control chars, excessive spaces, common separators.
+fn normalize_for_keyword_detection(content: &str) -> String {
+    let mut s = content.to_string();
+    // Remove zero-width characters (U+200B, U+200C, U+200D, U+FEFF, U+2060, etc.)
+    s = s.replace('\u{200B}', "")
+         .replace('\u{200C}', "")
+         .replace('\u{200D}', "")
+         .replace('\u{FEFF}', "")
+         .replace('\u{2060}', "");
+    // Remove other invisible/formatting chars that could be used as separators
+    s.retain(|ch| {
+        !matches!(ch,
+            '\u{00AD}'   // soft hyphen
+            | '\u{034F}'  // combining grapheme joiner
+            | '\u{180E}'  // Mongolian vowel separator
+            | '\u{2061}'..='\u{2064}' // invisible math operators
+        )
+    });
+    // Collapse multiple spaces/tabs/newlines into single space
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn detect_blocked_keywords(content: &str, blocked_keywords: &[String]) -> Vec<String> {
     if blocked_keywords.is_empty() {
         return Vec::new();
     }
 
-    let normalized = content.to_lowercase();
+    let normalized = normalize_for_keyword_detection(content).to_lowercase();
     blocked_keywords
         .iter()
-        .filter(|keyword| !keyword.is_empty() && normalized.contains(keyword.as_str()))
+        .filter(|keyword| {
+            if keyword.is_empty() { return false; }
+            normalized.contains(keyword.as_str())
+        })
         .cloned()
         .collect()
 }
 
+/// Count unique URLs in content, avoiding double-counting.
+/// Extracts full URLs and markdown links, then deduplicates by normalizing
+/// to avoid counting `https://www.x` as 2 separate links.
 fn count_comment_links(content: &str) -> usize {
-    ["http://", "https://", "www.", "]("]
-        .iter()
-        .map(|token| content.matches(token).count())
-        .sum()
+    // Use separate patterns to avoid complex regex escaping issues
+    let http_re = regex::Regex::new(r"(?i)https?://[^\s<>\x22\x27]+$").unwrap();
+    let www_re = regex::Regex::new(r"(?i)www\.[^\s<>\x22\x27]+$").unwrap();
+    let md_re = regex::Regex::new(r"\]\([^)]+\)$").unwrap();
+
+    let mut seen = std::collections::HashSet::new();
+
+    // Split into tokens (words) and check each
+    for token in content.split_whitespace() {
+        let lower = token.to_lowercase();
+        // Check if token looks like a URL or contains one at end
+        if http_re.is_match(token) || www_re.is_match(token) {
+            let normalized = lower.trim_end_matches(['.', ',', '!', '?', ';', ':', ')']).to_string();
+            if !normalized.is_empty() {
+                seen.insert(normalized);
+            }
+        } else if md_re.is_match(token) {
+            // Markdown link: extract URL from ](url)
+            if let Some(inner) = token.strip_prefix(']').and_then(|s| s.strip_prefix('(')).and_then(|s| s.strip_suffix(')')) {
+                seen.insert(inner.trim_end_matches(['.', ',', '!']).to_lowercase());
+            }
+        }
+    }
+
+    seen.len().min(10)
 }
 
 fn akismet_http_client() -> Result<HttpClient, String> {
@@ -3930,8 +4034,8 @@ fn akismet_required_meta_error(field: &str) -> CommentModerationAkismetResult {
         discard: false,
         error: true,
         recheck_after: None,
-        score: 40,
-        note: format!("Akismet skipped because required {field} is missing."),
+            score: 0,
+            note: format!("Akismet skipped because required {field} is missing. Graceful degradation: no penalty applied."),
     }
 }
 
@@ -4081,7 +4185,7 @@ fn run_akismet_comment_check(
             error: true,
             recheck_after: None,
             score: 40,
-            note: "Akismet API key missing.".to_string(),
+            note: "Akismet API key missing. Graceful degradation: no penalty applied.".to_string(),
         };
     }
 
@@ -4111,8 +4215,8 @@ fn run_akismet_comment_check(
                 discard: false,
                 error: true,
                 recheck_after: None,
-                score: 40,
-                note: format!("Akismet client init failed: {error}"),
+                score: 0,
+                note: format!("Akismet client init failed: {error}. Graceful degradation: no penalty applied."),
             };
         }
     };
@@ -4146,9 +4250,9 @@ fn run_akismet_comment_check(
                             discard: false,
                             error: true,
                             recheck_after,
-                            score: 40,
-                            note: format!(
-                                "Akismet request returned HTTP {}: {}{}",
+                        score: 0,
+                        note: format!(
+                            "Akismet request returned HTTP {}: {}{} (graceful degradation: no penalty)",
                                 status.as_u16(),
                                 body,
                                 debug_help
@@ -4166,9 +4270,9 @@ fn run_akismet_comment_check(
                             discard: false,
                             error: true,
                             recheck_after,
-                            score: 40,
-                            note: format!(
-                                "Akismet returned an unexpected response: {}{}",
+                        score: 0,
+                        note: format!(
+                            "Akismet returned an unexpected response: {}{} (graceful degradation: no penalty)",
                                 body,
                                 debug_help
                                     .map(|value| format!(" ({value})"))
@@ -4217,8 +4321,8 @@ fn run_akismet_comment_check(
                     discard: false,
                     error: true,
                     recheck_after: None,
-                    score: 40,
-                    note: format!("Akismet response parse failed: {error}"),
+                    score: 0,
+                    note: format!("Akismet response parse failed: {error}. Graceful degradation: no penalty applied."),
                 },
             }
         }
@@ -4229,8 +4333,8 @@ fn run_akismet_comment_check(
             discard: false,
             error: true,
             recheck_after: None,
-            score: 40,
-            note: format!("Akismet request failed: {error}"),
+            score: 0,
+            note: format!("Akismet request failed: {error}. Graceful degradation: no penalty applied."),
         },
     }
 }
@@ -4327,6 +4431,150 @@ fn submit_akismet_comment_feedback(
     }
 }
 
+/// AI content category severity weights for fine-grained scoring
+/// Higher weight = more severe, contributes more to final risk score
+fn get_ai_category_weight(category: &str) -> f64 {
+    match category.to_lowercase().as_str() {
+        // Highest severity - illegal/harmful content
+        "sexual_violence" | "child_sexual_abuse" => 1.8,
+        "self_harm" | "self-harm" => 1.5,
+
+        // High severity - harassment and hate
+        "harassment" => 1.4,
+        "harassment/threatening" => 1.5,
+        "hate" => 1.4,
+        "hate/threatening" => 1.5,
+        "violence" => 1.3,
+        "violence/graphic" => 1.6,
+
+        // Medium severity - inappropriate content
+        "sexual" => 1.2,
+        "sexual/minors" => 1.7,
+
+        // Lower severity - quality issues
+        "spam" => 0.9,
+        "fairness" => 0.7,
+        "medical" => 0.8,
+
+        // Default weight for unknown categories
+        _ => 1.0,
+    }
+}
+
+/// Get human-readable Chinese label for AI category
+fn get_ai_category_label(category: &str) -> String {
+    let cat_lower = category.to_lowercase();
+    match cat_lower.as_str() {
+        "sexual_violence" | "child_sexual_abuse" => String::from("性暴力"),
+        "self_harm" | "self-harm" => String::from("自残倾向"),
+        "harassment" => String::from("骚扰"),
+        "harassment/threatening" => String::from("威胁性骚扰"),
+        "hate" => String::from("仇恨言论"),
+        "hate/threatening" => String::from("威胁性仇恨言论"),
+        "violence" => String::from("暴力内容"),
+        "violence/graphic" => String::from("血腥暴力"),
+        "sexual" => String::from("色情内容"),
+        "sexual/minors" => String::from("未成年人色情"),
+        "spam" => String::from("垃圾信息"),
+        "fairness" => String::from("偏见内容"),
+        "medical" => String::from("医疗误导"),
+        _ => category.to_string(),
+    }
+}
+
+/// Preprocess Chinese content to improve AI moderation accuracy.
+/// Handles common evasion tactics in Chinese text:
+/// - Digit-to-character conversion (0-9 → 零一二三四五六七八九)
+/// - Common homophone/slang substitutions
+fn preprocess_chinese_content(content: &str) -> String {
+    let mut processed = content.to_string();
+
+    // Digit-to-Chinese character mapping (covers 0-9)
+    let digit_replacements: Vec<(char, &str)> = vec![
+        ('0', "零"), ('1', "一"), ('2', "二"), ('3', "三"),
+        ('4', "四"), ('5', "五"), ('6', "六"), ('7', "七"),
+        ('8', "八"), ('9', "九"),
+    ];
+    for (from, to) in digit_replacements {
+        processed = processed.replace(from, to);
+    }
+
+    // Common Chinese evasion substitutions (homophones/visual look-alikes)
+    let evasion_replacements: Vec<(&str, &str)> = vec![
+        // Common character substitutions used to bypass keyword filters
+        ("艹", "操"),   // Visual similarity
+        ("草马", "操妈"), // Partial substitution
+        ("特么", "他妈"), // Softened profanity
+        ("t m", "他妈"),  // Pinyin abbreviation
+        ("tm ", "他妈"),  // Pinyin abbreviation
+        ("nb", "牛逼"),  // Common slang
+        ("N B", "牛逼"), // Spaced slang
+        ("n b", "牛逼"), // Lowercase spaced
+        ("傻B", "傻逼"),  // Mixed script
+        ("sb", "傻逼"),   // Abbreviation
+        ("S B", "傻逼"),  // Spaced
+        ("s b", "傻逼"),
+        ("cnm", "操你妈"), // Severe profanity abbreviation
+        ("C N M", "操你妈"),
+        ("nmsl", "你妈死了"), // Internet slang
+    ];
+
+    for (from, to) in evasion_replacements {
+        processed = processed.replace(from, to);
+    }
+
+    // Normalize whitespace (collapses spaces, tabs, newlines)
+    processed.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Build the AI moderation API endpoint based on provider configuration
+fn build_ai_moderation_url(config: &InternalCommentModerationConfig, model: &str) -> (String, String) {
+    let normalized_provider = normalize_ai_provider(&config.ai_provider);
+    
+    match normalized_provider.as_str() {
+        "azure" => {
+            // Azure OpenAI format: https://{resource}.openai.azure.com/openai/deployments/{deployment-id}/moderations?api-version={version}
+            let base = if config.ai_base_url.trim().is_empty() {
+                "https://api.openai.azure.com".to_string()
+            } else {
+                config.ai_base_url.trim().trim_end_matches('/').to_string()
+            };
+            let deployment_id = if config.azure_deployment_id.trim().is_empty() {
+                // Use model name as deployment ID fallback
+                model.to_string()
+            } else {
+                config.azure_deployment_id.clone()
+            };
+            let api_version = if !config.azure_api_version.is_empty() {
+                config.azure_api_version.clone()
+            } else {
+                "2023-09-01-preview".to_string()
+            };
+            
+            let url = format!("{}/openai/deployments/{}/moderations?api-version={}", base, deployment_id, api_version);
+            (url, format!("Azure ({})", base))
+        }
+        
+        "custom" | _ => {
+            // Custom/Proxy: use user-provided base URL or fall back to OpenAI
+            let base = if config.ai_base_url.trim().is_empty() {
+                "https://api.openai.com".to_string()
+            } else {
+                config.ai_base_url.trim().trim_end_matches('/').to_string()
+            };
+            
+            let url = format!("{}/v1/moderations", base);
+            (url, format!("Custom ({})", base))
+        }
+    }
+}
+
+/// Run AI-powered comment moderation using configurable API endpoint
+/// Supports: OpenAI (official), Azure OpenAI, Custom/Proxy endpoints
+/// Enhanced with:
+/// - Category-weighted scoring for finer granularity
+/// - Chinese content preprocessing
+/// - Improved error handling with graceful degradation
 fn run_ai_comment_moderation(
     config: &InternalCommentModerationConfig,
     article: &ArticleRow,
@@ -4339,20 +4587,10 @@ fn run_ai_comment_moderation(
             flagged: false,
             score: 0,
             max_category_score: 0.0,
+            weighted_score: 0.0,
+            category_details: Vec::new(),
             flagged_categories: Vec::new(),
             note: "AI moderation disabled.".to_string(),
-        };
-    }
-
-    if !config.ai_provider.eq_ignore_ascii_case("openai") {
-        return CommentModerationAiResult {
-            enabled: true,
-            attempted: false,
-            flagged: false,
-            score: 20,
-            max_category_score: 0.0,
-            flagged_categories: Vec::new(),
-            note: format!("Unsupported AI provider: {}", config.ai_provider),
         };
     }
 
@@ -4362,10 +4600,12 @@ fn run_ai_comment_moderation(
             enabled: true,
             attempted: false,
             flagged: false,
-            score: 10,
+            score: 0,  // Config error, not content issue — no penalty
             max_category_score: 0.0,
+            weighted_score: 0.0,
+            category_details: Vec::new(),
             flagged_categories: Vec::new(),
-            note: "AI moderation API key missing.".to_string(),
+            note: "AI moderation API key missing. Configure it in admin settings. No penalty applied.".to_string(),
         };
     }
 
@@ -4375,17 +4615,32 @@ fn run_ai_comment_moderation(
         config.ai_model.trim()
     };
 
+    // Preprocess content for better Chinese understanding
+    let preprocessed_content = preprocess_chinese_content(input.content.trim());
+
+    // Enhanced input payload with context for better AI understanding
     let input_payload = format!(
-        "Article title: {}\nNickname: {}\nEmail: {}\nWebsite: {}\nComment:\n{}",
+        "=== BLOG COMMENT MODERATION ===\n\
+         Article Title: {}\n\
+         Commenter Nickname: {}\n\
+         Commenter Email: {}\n\
+         Website: {}\n\
+         \n\
+         === ORIGINAL COMMENT ===\n\
+         {}\
+         \n\
+         === PREPROCESSED (for Chinese text analysis) ===\n\
+         {}",
         article.title,
         input.nickname.trim(),
         input.email.trim(),
         input.website.clone().unwrap_or_default().trim(),
-        input.content.trim()
+        input.content.trim(),
+        preprocessed_content
     );
 
     let client = match HttpClient::builder()
-        .timeout(StdDuration::from_secs(6))
+        .timeout(StdDuration::from_secs(15))  // Increased timeout for proxy/custom endpoints
         .build()
     {
         Ok(client) => client,
@@ -4394,38 +4649,46 @@ fn run_ai_comment_moderation(
                 enabled: true,
                 attempted: false,
                 flagged: false,
-                score: 20,
+                score: 0,
                 max_category_score: 0.0,
+                weighted_score: 0.0,
+                category_details: Vec::new(),
                 flagged_categories: Vec::new(),
-                note: format!("AI moderation client init failed: {error}"),
+                note: format!("AI client initialization failed: {error}. Skipping AI moderation."),
             };
         }
     };
 
-    let response = client
-        .post("https://api.openai.com/v1/moderations")
+    // Build dynamic endpoint based on provider
+    let (api_endpoint, endpoint_label) = build_ai_moderation_url(config, model);
+
+    // Make request to the appropriate endpoint
+    let request_builder = client
+        .post(&api_endpoint)
         .bearer_auth(api_key)
         .json(&json!({
             "model": model,
             "input": input_payload,
-        }))
-        .send();
+        }));
 
-    let response = match response {
+    let response = match request_builder.send() {
         Ok(value) => value,
         Err(error) => {
             return CommentModerationAiResult {
                 enabled: true,
                 attempted: true,
                 flagged: false,
-                score: 25,
+                score: 0,
                 max_category_score: 0.0,
+                weighted_score: 0.0,
+                category_details: Vec::new(),
                 flagged_categories: Vec::new(),
-                note: format!("AI moderation request failed: {error}"),
+                note: format!("API request failed {}: {}. Endpoint: {}", endpoint_label, error, api_endpoint),
             };
         }
     };
 
+    let status = response.status();
     let payload: Value = match response.json() {
         Ok(value) => value,
         Err(error) => {
@@ -4433,10 +4696,12 @@ fn run_ai_comment_moderation(
                 enabled: true,
                 attempted: true,
                 flagged: false,
-                score: 25,
+                score: 0,
                 max_category_score: 0.0,
+                weighted_score: 0.0,
+                category_details: Vec::new(),
                 flagged_categories: Vec::new(),
-                note: format!("AI moderation response parse failed: {error}"),
+                note: format!("Failed to parse API response (HTTP {status}): {}. Endpoint: {}", error, api_endpoint),
             };
         }
     };
@@ -4451,36 +4716,118 @@ fn run_ai_comment_moderation(
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
 
+    // Enhanced category analysis with weights
     let mut max_category_score = 0.0_f64;
+    let mut weighted_sum = 0.0_f64;
+    let mut total_weight = 0.0_f64;
     let mut flagged_categories = Vec::<String>::new();
+    let mut category_details = Vec::<serde_json::Value>::new();
+
     if let Some(scores) = result
         .and_then(|value| value.get("category_scores"))
         .and_then(|value| value.as_object())
     {
         for (category, score) in scores {
-            if let Some(score) = score.as_f64() {
-                if score > max_category_score {
-                    max_category_score = score;
+            if let Some(score_val) = score.as_f64() {
+                let weight = get_ai_category_weight(category);
+                let label = get_ai_category_label(category);
+
+                // Track maximum raw score
+                if score_val > max_category_score {
+                    max_category_score = score_val;
                 }
-                if score >= 0.35 {
-                    flagged_categories.push(category.to_string());
+
+                // Calculate weighted contribution
+                let weighted_score = score_val * weight;
+                weighted_sum += weighted_score;
+                total_weight += weight;
+
+                // Flag if exceeds threshold (using both raw and adjusted)
+                let adjusted_threshold = if weight >= 1.4 { 0.25 } else { 0.35 };
+                if score_val >= adjusted_threshold {
+                    flagged_categories.push(format!("{} ({})", label, category));
                 }
+
+                // Store detailed category info for frontend display
+                category_details.push(json!({
+                    "category": category,
+                    "label": label,
+                    "score": score_val,
+                    "weight": weight,
+                    "weightedScore": weighted_score,
+                    "flagged": score_val >= adjusted_threshold,
+                }));
             }
         }
     }
 
-    let score = if flagged {
-        if max_category_score >= 0.85 {
-            90
-        } else if max_category_score >= 0.65 {
-            75
-        } else {
-            60
-        }
-    } else if max_category_score >= 0.5 {
-        35
+    // Calculate final score using weighted average with non-linear mapping
+    let avg_weighted_score = if total_weight > 0.0 {
+        weighted_sum / total_weight
     } else {
-        0
+        0.0
+    };
+
+    // Fine-grained scoring with continuous coverage (no gaps)
+    // Levels: 0, 10, 28, 42, 48, 62, 75, 85, 95
+    let score = if flagged {
+        // Flagged content: higher scores based on severity
+        if avg_weighted_score >= 0.80 || max_category_score >= 0.90 {
+            95  // Critical: severe violation
+        } else if avg_weighted_score >= 0.65 || max_category_score >= 0.75 {
+            85  // High: clear policy violation
+        } else if avg_weighted_score >= 0.50 || max_category_score >= 0.60 {
+            75  // Elevated: probable violation
+        } else if avg_weighted_score >= 0.35 || max_category_score >= 0.45 {
+            62  // Moderate: suspicious content
+        } else {
+            48  // Low-moderate: borderline (lowered from 50 to close gap)
+        }
+    } else if max_category_score >= 0.55 {
+        // Not flagged but notable category scores — raised threshold slightly
+        42  // Warrants review (raised from 38 to close gap)
+    } else if max_category_score >= 0.40 {
+        // Minor concerns
+        28  // Slightly suspicious (raised from 22)
+    } else if max_category_score >= 0.25 {
+        // Very minor
+        10  // Negligible concern
+    } else {
+        0   // Clean
+    };
+
+    // Build detailed note for audit trail
+    let summary_note = if flagged {
+        let top_categories = flagged_categories.iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if flagged_categories.len() > 3 {
+            format!(
+                "AI FLAGGED ({:.0}% confidence). Top violations: {} (+{} others). Weighted avg: {:.2}",
+                (max_category_score * 100.0),
+                top_categories,
+                flagged_categories.len() - 3,
+                avg_weighted_score
+            )
+        } else {
+            format!(
+                "AI FLAGGED ({:.0}% confidence). Violations: {}. Weighted avg: {:.2}",
+                (max_category_score * 100.0),
+                top_categories,
+                avg_weighted_score
+            )
+        }
+    } else if score > 0 {
+        format!(
+            "AI passed but detected minor signals ({:.0}% max category). Score: {}",
+            (max_category_score * 100.0),
+            score
+        )
+    } else {
+        "AI moderation passed. No issues detected.".to_string()
     };
 
     CommentModerationAiResult {
@@ -4489,12 +4836,33 @@ fn run_ai_comment_moderation(
         flagged,
         score,
         max_category_score,
+        weighted_score: avg_weighted_score,
+        category_details,
         flagged_categories,
-        note: if flagged {
-            "AI moderation flagged this comment.".to_string()
-        } else {
-            "AI moderation passed.".to_string()
-        },
+        note: summary_note,
+    }
+}
+
+/// Normalize raw moderation risk score to 0-100 range.
+/// Uses soft sigmoid-like compression to handle the gap between
+/// realistic scores (~0-160) and theoretical max (~300).
+/// Curve: linear 0→60, then diminishing returns 60-130, hard cap at 100.
+fn normalize_moderation_score(raw: i32) -> i32 {
+    if raw <= 0 {
+        return 0;
+    }
+    if raw >= 140 {
+        return 100;
+    }
+    // Piecewise: preserve linearity for normal range, compress extremes
+    if raw <= 60 {
+        raw
+    } else if raw <= 100 {
+        // Compressed: maps 60-100 → 60-82
+        60 + ((raw - 60) * 11 / 20)
+    } else {
+        // Heavy compression: maps 100-139 → 82-99
+        82 + ((raw - 100) * 17 / 40)
     }
 }
 
@@ -4547,7 +4915,8 @@ fn evaluate_comment_moderation(
     let akismet_result =
         run_akismet_comment_check(config, article, input, client_meta, public_site_url);
     let akismet_needs_manual_review =
-        akismet_result.enabled && (akismet_result.error || akismet_result.recheck_after.is_some());
+        // Only actual errors should block auto-approve; recheck is a weak signal
+        akismet_result.enabled && akismet_result.error;
     let akismet_requested_discard = akismet_result.enabled && akismet_result.discard;
     if akismet_result.enabled {
         score += akismet_result.score;
@@ -4560,7 +4929,10 @@ fn evaluate_comment_moderation(
         reasons.push(ai_result.note.clone());
     }
 
-    score = score.clamp(0, 100);
+    // Normalize raw score to 0-100 using soft compression.
+    // Theoretical max is ~300 (70+25+15+95+95), but realistic combos rarely exceed 160.
+    // Uses sigmoid-like curve: preserves discrimination at low end, compresses extreme highs.
+    score = normalize_moderation_score(score);
     let risk_level = if score >= config.high_risk_min_score {
         "high"
     } else if score <= config.low_risk_max_score {
@@ -6321,6 +6693,155 @@ async fn admin_update_comment_moderation_config(
     .await
 }
 
+/// Test AI moderation API connection
+#[derive(Deserialize)]
+struct TestAiConnectionInput {
+    provider: Option<String>,
+    model: Option<String>,
+    api_key: String,
+    base_url: Option<String>,              // Custom API base URL
+    azure_deployment_id: Option<String>,  // Azure deployment ID
+    azure_api_version: Option<String>,   // Azure API version
+}
+
+async fn admin_test_ai_connection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<TestAiConnectionInput>,
+) -> Result<Json<Value>, ApiError> {
+    run_blocking(move || {
+        let _auth = require_admin_auth(&state, &headers)?;
+
+        let provider = input.provider.unwrap_or_else(|| "openai".to_string());
+        let normalized_provider = normalize_ai_provider(&provider);
+
+        let api_key = input.api_key.trim();
+        if api_key.is_empty() {
+            return Ok(Json(json!({
+                "success": false,
+                "message": "API key is required for testing.",
+            })));
+        }
+
+        let model = input.model.unwrap_or_else(|| "omni-moderation-latest".to_string());
+
+        // Build test config for URL construction
+        let test_config = InternalCommentModerationConfig {
+            enabled: true,
+            akismet_enabled: false,
+            akismet_api_key: String::new(),
+            akismet_site_url: String::new(),
+            akismet_blog_lang: "zh-CN".to_string(),
+            ai_enabled: true,
+            ai_provider: normalized_provider.clone(),
+            ai_api_key: api_key.to_string(),
+            ai_model: model.to_string(),
+            ai_base_url: input.base_url.unwrap_or_default().trim().to_string(),
+            azure_deployment_id: input.azure_deployment_id.unwrap_or_default().to_string(),
+            azure_api_version: input.azure_api_version.unwrap_or_else(|| "2023-09-01-preview".to_string()),
+            auto_approve_low_risk: true,
+            auto_reject_high_risk: true,
+            low_risk_max_score: 35,
+            high_risk_min_score: 80,
+            blocked_keywords: Vec::new(),
+            rate_limit_enabled: true,
+            rate_limit_min_interval_seconds: 8,
+            rate_limit_per_article_window_minutes: 10,
+            rate_limit_per_article_email_max: 3,
+            rate_limit_per_article_ip_max: 0,
+            rate_limit_global_window_minutes: 60,
+            rate_limit_global_email_max: 15,
+            rate_limit_global_ip_max: 60,
+            geoip_enabled: true,
+            geoip_provider: "ipapi".to_string(),
+            geoip_api_key: String::new(),
+        };
+
+        // Build dynamic endpoint based on provider
+        let (api_endpoint, endpoint_label) = build_ai_moderation_url(&test_config, &model);
+
+        // Build client with timeout
+        let client = match HttpClient::builder()
+            .timeout(StdDuration::from_secs(15))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(Json(json!({
+                    "success": false,
+                    "message": format!("Failed to build HTTP client: {}", e),
+                })));
+            }
+        };
+
+        // Record start time
+        let start = std::time::Instant::now();
+
+        // Make test request
+        let test_payload = json!({
+            "model": model,
+            "input": "This is a test message for AI moderation connection testing. No actual content to moderate.",
+        });
+
+        let result = match client
+            .post(&api_endpoint)
+            .bearer_auth(api_key)
+            .json(&test_payload)
+            .send()
+        {
+            Ok(response) => response,
+            Err(e) => {
+                return Ok(Json(json!({
+                    "success": false,
+                    "message": format!("Failed to connect to {}: {}. Please check your network and API key.", endpoint_label, e),
+                    "endpoint": api_endpoint,
+                })));
+            }
+        };
+
+        let latency = start.elapsed().as_millis() as i64;
+        let status = result.status();
+
+        // Parse response
+        let payload: Value = match result.json() {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(Json(json!({
+                    "success": false,
+                    "message": format!("Invalid response from API (HTTP {}): {}", status, e),
+                    "latency": latency,
+                    "endpoint": api_endpoint,
+                })));
+            }
+        };
+
+        // Check for errors
+        if let Some(error_msg) = payload.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()) {
+            return Ok(Json(json!({
+                "success": false,
+                "message": format!("API error: {}", error_msg),
+                "latency": latency,
+                "endpoint": api_endpoint,
+            })));
+        }
+
+        // Success - include provider info in response
+        Ok(Json(json!({
+            "success": true,
+            "message": format!(
+                "Successfully connected to {} using model '{}'. Connection is working.",
+                endpoint_label.replace(['(', ')'], ""),
+                model
+            ),
+            "latency": latency,
+            "provider": normalized_provider,
+            "model": model,
+            "endpoint": api_endpoint,
+        })))
+    })
+    .await
+}
+
 async fn admin_debug_comment_captcha(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6477,6 +6998,26 @@ fn load_admin_comment_items(conn: &mut PgClient) -> Result<Vec<AdminCommentItem>
         .into_iter()
         .map(|row| {
             let parent_id: Option<String> = row.get(4);
+
+            // Parse AI JSON to extract category details and weighted score
+            let ai_raw: Option<String> = row.get(20);
+            let (ai_categories, ai_weighted_score) = if let Some(ref ai_json_str) = ai_raw {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&ai_json_str) {
+                    let categories = parsed
+                        .get("categoryDetails")
+                        .and_then(|v| v.as_array())
+                        .cloned();
+                    let weighted = parsed
+                        .get("weightedScore")
+                        .and_then(|v| v.as_f64());
+                    (categories, weighted)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
             AdminCommentItem {
                 id: row.get(0),
                 article: AdminCommentArticleRef {
@@ -6503,7 +7044,9 @@ fn load_admin_comment_items(conn: &mut PgClient) -> Result<Vec<AdminCommentItem>
                 moderation_risk_score: row.get(17),
                 moderation_summary: row.get(18),
                 moderation_akismet_raw: row.get(19),
-                moderation_ai_raw: row.get(20),
+                moderation_ai_raw: ai_raw,
+                moderation_ai_categories: ai_categories,
+                moderation_ai_weighted_score: ai_weighted_score,
                 moderation_pipeline_version: row.get(21),
                 created_at: row.get(22),
                 updated_at: row.get(23),

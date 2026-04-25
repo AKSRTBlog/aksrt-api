@@ -566,30 +566,6 @@ pub(crate) fn render_comment_locked_markdown(markdown: &str, include_hidden: boo
     rendered
 }
 
-#[derive(Clone)]
-struct PendingCommentNotification {
-    article_title: String,
-    article_slug: String,
-    nickname: String,
-    email: String,
-    website: Option<String>,
-    content: String,
-    parent_id: Option<String>,
-    status: String,
-}
-
-#[derive(Clone)]
-struct PendingFriendLinkNotification {
-    site_name: String,
-    site_url: String,
-    icon_url: Option<String>,
-    description: String,
-    contact_name: String,
-    contact_email: String,
-    message: Option<String>,
-    status: String,
-}
-
 struct InternalCaptchaConfig {
     enabled: bool,
     provider: String,
@@ -3067,19 +3043,6 @@ fn load_admin_by_id(conn: &mut PgClient, admin_id: &str) -> Result<Option<AdminR
         }))
 }
 
-fn load_active_admin_emails(conn: &mut PgClient) -> Result<Vec<String>, ApiError> {
-    Ok(conn
-        .query(
-            "SELECT email FROM admins WHERE status = 'active' AND email IS NOT NULL AND email != ''",
-            &[],
-        )
-        .map_err(db_error)?
-        .iter()
-        .map(|row| row.get::<usize, String>(0))
-        .filter(|email| !email.trim().is_empty())
-        .collect())
-}
-
 fn load_public_admin_avatar_url(conn: &mut PgClient) -> Result<Option<String>, ApiError> {
     let row = conn
         .query_opt(
@@ -5475,193 +5438,6 @@ fn send_notification_emails(
     Ok(true)
 }
 
-fn try_send_pending_comment_notification(
-    conn: &mut PgClient,
-    public_site_url: &str,
-    article: &ArticleRow,
-    notification: &PendingCommentNotification,
-) {
-    let article_url = site_url(public_site_url, &format!("/articles/{}", article.slug));
-    let admin_url = site_url(public_site_url, "/admin/comments");
-    let website_line = notification
-        .website
-        .as_deref()
-        .map(|value| format!("\nWebsite: {value}"))
-        .unwrap_or_default();
-    let reply_line = notification
-        .parent_id
-        .as_deref()
-        .map(|value| format!("\nReply to comment: {value}"))
-        .unwrap_or_default();
-    let website_html = notification
-        .website
-        .as_deref()
-        .map(|value| format!("<p><strong>Website:</strong> {}</p>", escape_html(value)))
-        .unwrap_or_default();
-    let reply_html = notification
-        .parent_id
-        .as_deref()
-        .map(|value| {
-            format!(
-                "<p><strong>Reply to comment:</strong> {}</p>",
-                escape_html(value)
-            )
-        })
-        .unwrap_or_default();
-
-    let text_body = format!(
-        "A new comment is waiting for review.\n\nArticle: {}\nArticle URL: {}\nAdmin review: {}\nStatus: {}\nNickname: {}\nEmail: {}{}{}\n\nContent:\n{}",
-        article.title,
-        article_url,
-        admin_url,
-        notification.status,
-        notification.nickname,
-        notification.email,
-        website_line,
-        reply_line,
-        notification.content,
-    );
-    let html_body = format!(
-        "<h2>New comment pending review</h2>\
-         <p><strong>Article:</strong> {}</p>\
-         <p><strong>Article URL:</strong> <a href=\"{article_url}\">{article_url}</a></p>\
-         <p><strong>Admin review:</strong> <a href=\"{admin_url}\">{admin_url}</a></p>\
-         <p><strong>Status:</strong> {}</p>\
-         <p><strong>Nickname:</strong> {}</p>\
-         <p><strong>Email:</strong> {}</p>\
-         {}{}\
-         <p><strong>Content:</strong></p>\
-         <p>{}</p>",
-        escape_html(&notification.article_title),
-        escape_html(&notification.status),
-        escape_html(&notification.nickname),
-        escape_html(&notification.email),
-        website_html,
-        reply_html,
-        htmlize_multiline_text(&notification.content),
-    );
-
-    match read_smtp_config_record(conn).and_then(|config| {
-        let mut recipients = vec![notification.email.clone()];
-        if let Ok(admin_emails) = load_active_admin_emails(conn) {
-            for admin_email in admin_emails {
-                if admin_email != notification.email {
-                    recipients.push(admin_email);
-                }
-            }
-        }
-        send_notification_emails(
-            &config,
-            &format!("[Blog] New comment pending: {}", notification.article_title),
-            text_body,
-            html_body,
-            &recipients,
-        )
-    }) {
-        Ok(_) => {}
-        Err(error) => {
-            eprintln!(
-                "Failed to send pending comment notification for article {}: {}",
-                notification.article_slug, error.message
-            );
-        }
-    }
-}
-
-fn try_send_pending_friend_link_notification(
-    conn: &mut PgClient,
-    public_site_url: &str,
-    notification: &PendingFriendLinkNotification,
-) {
-    let admin_url = site_url(public_site_url, "/admin/friend-links");
-    let icon_line = notification
-        .icon_url
-        .as_deref()
-        .map(|value| format!("\nIcon URL: {value}"))
-        .unwrap_or_default();
-    let message_line = notification
-        .message
-        .as_deref()
-        .map(|value| format!("\nMessage:\n{value}"))
-        .unwrap_or_default();
-    let icon_html = notification
-        .icon_url
-        .as_deref()
-        .map(|value| format!("<p><strong>Icon URL:</strong> {}</p>", escape_html(value)))
-        .unwrap_or_default();
-    let message_html = notification
-        .message
-        .as_deref()
-        .map(|value| {
-            format!(
-                "<p><strong>Message:</strong></p><p>{}</p>",
-                htmlize_multiline_text(value)
-            )
-        })
-        .unwrap_or_default();
-
-    let text_body = format!(
-        "A new friend link application is waiting for review.\n\nSite: {}\nSite URL: {}\nAdmin review: {}\nStatus: {}\nContact: {}\nContact email: {}{}\n\nDescription:\n{}{}",
-        notification.site_name,
-        notification.site_url,
-        admin_url,
-        notification.status,
-        notification.contact_name,
-        notification.contact_email,
-        icon_line,
-        notification.description,
-        message_line,
-    );
-    let html_body = format!(
-        "<h2>New friend link application pending review</h2>\
-         <p><strong>Site:</strong> {}</p>\
-         <p><strong>Site URL:</strong> <a href=\"{}\">{}</a></p>\
-         <p><strong>Admin review:</strong> <a href=\"{admin_url}\">{admin_url}</a></p>\
-         <p><strong>Status:</strong> {}</p>\
-         <p><strong>Contact:</strong> {}</p>\
-         <p><strong>Contact email:</strong> {}</p>\
-         {}\
-         <p><strong>Description:</strong></p>\
-         <p>{}</p>\
-         {}",
-        escape_html(&notification.site_name),
-        escape_html(&notification.site_url),
-        escape_html(&notification.site_url),
-        escape_html(&notification.status),
-        escape_html(&notification.contact_name),
-        escape_html(&notification.contact_email),
-        icon_html,
-        htmlize_multiline_text(&notification.description),
-        message_html,
-    );
-
-    match read_smtp_config_record(conn).and_then(|config| {
-        let mut recipients = vec![notification.contact_email.clone()];
-        if let Ok(admin_emails) = load_active_admin_emails(conn) {
-            for admin_email in admin_emails {
-                if admin_email != notification.contact_email {
-                    recipients.push(admin_email);
-                }
-            }
-        }
-        send_notification_emails(
-            &config,
-            &format!("[Blog] New friend link pending: {}", notification.site_name),
-            text_body,
-            html_body,
-            &recipients,
-        )
-    }) {
-        Ok(_) => {}
-        Err(error) => {
-            eprintln!(
-                "Failed to send pending friend link notification for site {}: {}",
-                notification.site_name, error.message
-            );
-        }
-    }
-}
-
 fn try_send_comment_review_notification(
     conn: &mut PgClient,
     public_site_url: &str,
@@ -5931,16 +5707,6 @@ async fn submit_public_comment(
             read_internal_comment_moderation_config(&mut conn, &state.config.public_site_url)?;
         let country_name =
             resolve_comment_country_name(&moderation_config, client_meta.ip.as_deref());
-        let notification = PendingCommentNotification {
-            article_title: article.title.clone(),
-            article_slug: article.slug.clone(),
-            nickname: input.nickname.trim().to_string(),
-            email: input.email.trim().to_string(),
-            website: normalize_optional_text(input.website.clone()),
-            content: input.content.trim().to_string(),
-            parent_id: input.parent_id.clone(),
-            status: "pending".to_string(),
-        };
         let created = Database::new(&mut conn).create_public_comment(
             &article.id,
             input,
@@ -5959,14 +5725,12 @@ async fn submit_public_comment(
         let final_result =
             Database::new(&mut conn).apply_comment_moderation_outcome(&created.id, moderation)?;
 
-        if final_result.status == "pending" {
-            let mut notification = notification.clone();
-            notification.status = final_result.status.clone();
-            try_send_pending_comment_notification(
+        // 仅发送审核结果通知给评论者
+        if let Ok(comment) = load_admin_comment_item(&mut conn, &created.id) {
+            try_send_comment_review_notification(
                 &mut conn,
                 &state.config.public_site_url,
-                &article,
-                &notification,
+                &comment,
             );
         }
 
@@ -6004,44 +5768,14 @@ async fn submit_public_friend_link_application(
     headers: HeaderMap,
     Json(input): Json<CreateFriendLinkApplicationInput>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let public_site_url = state.config.public_site_url.clone();
-    let database_url = state.config.database_url.clone();
-    let result = run_blocking(move || {
+    run_blocking(move || {
         let mut conn = open_connection(&state)?;
         validate_geetest_captcha(&state, &mut conn, "friendLink", input.captcha.as_ref())?;
-        let notification = PendingFriendLinkNotification {
-            site_name: input.site_name.trim().to_string(),
-            site_url: input.site_url.trim().to_string(),
-            icon_url: normalize_optional_text(input.icon_url.clone()),
-            description: input.description.trim().to_string(),
-            contact_name: input.contact_name.trim().to_string(),
-            contact_email: input.contact_email.trim().to_string(),
-            message: normalize_optional_text(input.message.clone()),
-            status: "pending".to_string(),
-        };
         let (ip, user_agent) = extract_client_meta(&headers);
-        let result =
-            Database::new(&mut conn).create_friend_link_application(input, ip, user_agent)?;
-        Ok((result, notification))
+        Database::new(&mut conn).create_friend_link_application(input, ip, user_agent)
     })
-    .await?;
-
-    let notification = result.1.clone();
-    tokio::spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            if let Ok(mut conn) = PgClient::connect(&database_url, NoTls) {
-                try_send_pending_friend_link_notification(
-                    &mut conn,
-                    &public_site_url,
-                    &notification,
-                );
-            }
-        })
-        .await
-        .ok();
-    });
-
-    Ok(created(result.0))
+    .await
+    .map(created)
 }
 
 async fn list_public_banners(

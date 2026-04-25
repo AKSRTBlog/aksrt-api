@@ -42,8 +42,8 @@ RUN --mount=type=cache,id=aksrtblog-cargo-registry,target=/usr/local/cargo/regis
     rm -rf target/release/deps/aksrtblog_rust_api* target/release/.fingerprint/aksrtblog-rust-api-* && \
     rm -rf src
 
-COPY src/ ./src/
-COPY migrations/ ./migrations/
+COPY src ./src/
+COPY migrations ./migrations/
 
 RUN --mount=type=cache,id=aksrtblog-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=aksrtblog-cargo-git,target=/usr/local/cargo/git,sharing=locked \

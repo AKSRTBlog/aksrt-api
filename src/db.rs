@@ -1696,7 +1696,13 @@ impl<'a> Database<'a> {
             .azure_api_version
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| current.azure_api_version.clone().unwrap_or_else(|| "2023-09-01-preview".to_string()));
+            .unwrap_or_else(|| {
+                if current.azure_api_version.is_empty() {
+                    "2023-09-01-preview".to_string()
+                } else {
+                    current.azure_api_version.clone()
+                }
+            });
 
         let auto_approve_low_risk = input
             .auto_approve_low_risk
@@ -1770,7 +1776,7 @@ impl<'a> Database<'a> {
         );
         let blocked_keywords_json = serialize_json_value(&blocked_keywords)?;
         let safe_provider = if ai_provider == "openai" {
-            ai_provider
+            ai_provider.clone()
         } else {
             "openai".to_string()
         };
@@ -1784,7 +1790,7 @@ impl<'a> Database<'a> {
         }
 
         // Normalize provider - allow openai/azure/custom (no longer force to openai)
-        let safe_provider = normalize_ai_provider(&ai_provider);
+        let safe_provider = normalize_ai_provider(&safe_provider);
 
         self.conn
             .execute(

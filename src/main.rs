@@ -3609,7 +3609,7 @@ fn read_internal_comment_moderation_config(
     let mut config = row
         .map(|row| {
             let blocked_keywords = row
-                .get::<usize, String>(15)
+                .get::<usize, String>(16)
                 .parse::<serde_json::Value>()
                 .ok()
                 .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
@@ -3633,17 +3633,17 @@ fn read_internal_comment_moderation_config(
                 low_risk_max_score: row.get(14),
                 high_risk_min_score: row.get(15),
                 blocked_keywords,
-                rate_limit_enabled: row.get(16),
-                rate_limit_min_interval_seconds: row.get(17),
-                rate_limit_per_article_window_minutes: row.get(18),
-                rate_limit_per_article_email_max: row.get(19),
-                rate_limit_per_article_ip_max: row.get(20),
-                rate_limit_global_window_minutes: row.get(21),
-                rate_limit_global_email_max: row.get(22),
-                rate_limit_global_ip_max: row.get(23),
-                geoip_enabled: row.get(24),
-                geoip_provider: row.get(25),
-                geoip_api_key: row.get(26),
+                rate_limit_enabled: row.get(17),
+                rate_limit_min_interval_seconds: row.get(18),
+                rate_limit_per_article_window_minutes: row.get(19),
+                rate_limit_per_article_email_max: row.get(20),
+                rate_limit_per_article_ip_max: row.get(21),
+                rate_limit_global_window_minutes: row.get(22),
+                rate_limit_global_email_max: row.get(23),
+                rate_limit_global_ip_max: row.get(24),
+                geoip_enabled: row.get(25),
+                geoip_provider: row.get(26),
+                geoip_api_key: row.get(27),
             }
         })
         .unwrap_or(InternalCommentModerationConfig {
@@ -8620,18 +8620,57 @@ fn load_public_comments(
         );
     }
 
-    let mut roots = Vec::new();
-    for comment in rows {
-        if let Some(current) = mapped.get(&comment.id).cloned() {
-            if let Some(parent_id) = comment.parent_id {
-                if let Some(parent) = mapped.get_mut(&parent_id) {
-                    parent.replies.push(current);
-                }
-            } else {
-                roots.push(current);
+    let mut root_ids = Vec::new();
+    let mut child_ids_by_parent = HashMap::<String, Vec<String>>::new();
+    for comment in &rows {
+        if let Some(parent_id) = comment.parent_id.as_ref() {
+            if mapped.contains_key(parent_id) {
+                child_ids_by_parent
+                    .entry(parent_id.clone())
+                    .or_default()
+                    .push(comment.id.clone());
+                continue;
             }
         }
+
+        root_ids.push(comment.id.clone());
     }
+
+    fn build_comment_tree(
+        comment_id: &str,
+        mapped: &HashMap<String, PublicCommentItem>,
+        child_ids_by_parent: &HashMap<String, Vec<String>>,
+        visiting: &mut Vec<String>,
+    ) -> Option<PublicCommentItem> {
+        if visiting.iter().any(|id| id == comment_id) {
+            return None;
+        }
+
+        let mut current = mapped.get(comment_id)?.clone();
+        visiting.push(comment_id.to_string());
+        current.replies = child_ids_by_parent
+            .get(comment_id)
+            .map(|child_ids| {
+                child_ids
+                    .iter()
+                    .filter_map(|child_id| {
+                        build_comment_tree(child_id, mapped, child_ids_by_parent, visiting)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        visiting.pop();
+
+        Some(current)
+    }
+
+    let mut visiting = Vec::new();
+    let roots = root_ids
+        .iter()
+        .filter_map(|comment_id| {
+            build_comment_tree(comment_id, &mapped, &child_ids_by_parent, &mut visiting)
+        })
+        .collect();
 
     Ok(roots)
 }

@@ -1775,11 +1775,7 @@ impl<'a> Database<'a> {
             rate_limit_global_ip_max,
         );
         let blocked_keywords_json = serialize_json_value(&blocked_keywords)?;
-        let safe_provider = if ai_provider == "openai" {
-            ai_provider.clone()
-        } else {
-            "openai".to_string()
-        };
+        let safe_provider = normalize_ai_provider(&ai_provider);
         let safe_site_url = if validate_url(&akismet_site_url) {
             akismet_site_url
         } else {
@@ -1788,9 +1784,6 @@ impl<'a> Database<'a> {
         if akismet_enabled {
             verify_akismet_api_key(&akismet_api_key, &safe_site_url)?;
         }
-
-        // Normalize provider - allow openai/azure/custom (no longer force to openai)
-        let safe_provider = normalize_ai_provider(&safe_provider);
 
         self.conn
             .execute(

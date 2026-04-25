@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS comments (
   content TEXT NOT NULL,
   status TEXT NOT NULL,
   ip TEXT,
+  country_name TEXT,
   user_agent TEXT,
   reviewed_by TEXT,
   reviewed_at TIMESTAMPTZ,

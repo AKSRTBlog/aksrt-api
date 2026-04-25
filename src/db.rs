@@ -555,6 +555,7 @@ impl<'a> Database<'a> {
                         rate_limit_enabled, rate_limit_min_interval_seconds,
                         rate_limit_per_article_window_minutes, rate_limit_per_article_email_max, rate_limit_per_article_ip_max,
                         rate_limit_global_window_minutes, rate_limit_global_email_max, rate_limit_global_ip_max,
+                        geoip_enabled, geoip_provider, geoip_api_key,
                         created_at, updated_at
                      ) VALUES (
                         $1, TRUE, FALSE, '', $2, 'zh-CN',
@@ -562,6 +563,7 @@ impl<'a> Database<'a> {
                         TRUE, TRUE,
                         35, 80, '[]'::jsonb,
                         TRUE, $3, $4, $5, $6, $7, $8, $9,
+                        TRUE, 'ipapi', '',
                         NOW(), NOW()
                      )",
                     &[
@@ -707,6 +709,9 @@ impl<'a> Database<'a> {
                     rate_limit_global_window_minutes INTEGER NOT NULL DEFAULT 60,
                     rate_limit_global_email_max INTEGER NOT NULL DEFAULT 15,
                     rate_limit_global_ip_max INTEGER NOT NULL DEFAULT 60,
+                    geoip_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    geoip_provider TEXT NOT NULL DEFAULT 'ipapi',
+                    geoip_api_key TEXT NOT NULL DEFAULT '',
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
@@ -719,9 +724,13 @@ impl<'a> Database<'a> {
                     ADD COLUMN IF NOT EXISTS rate_limit_per_article_ip_max INTEGER NOT NULL DEFAULT 0,
                     ADD COLUMN IF NOT EXISTS rate_limit_global_window_minutes INTEGER NOT NULL DEFAULT 60,
                     ADD COLUMN IF NOT EXISTS rate_limit_global_email_max INTEGER NOT NULL DEFAULT 15,
-                    ADD COLUMN IF NOT EXISTS rate_limit_global_ip_max INTEGER NOT NULL DEFAULT 60;
+                    ADD COLUMN IF NOT EXISTS rate_limit_global_ip_max INTEGER NOT NULL DEFAULT 60,
+                    ADD COLUMN IF NOT EXISTS geoip_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    ADD COLUMN IF NOT EXISTS geoip_provider TEXT NOT NULL DEFAULT 'ipapi',
+                    ADD COLUMN IF NOT EXISTS geoip_api_key TEXT NOT NULL DEFAULT '';
 
                 ALTER TABLE comments
+                    ADD COLUMN IF NOT EXISTS country_name TEXT,
                     ADD COLUMN IF NOT EXISTS moderation_risk_level TEXT,
                     ADD COLUMN IF NOT EXISTS moderation_risk_score INTEGER,
                     ADD COLUMN IF NOT EXISTS moderation_summary TEXT,
@@ -869,6 +878,7 @@ impl<'a> Database<'a> {
         input: CreateCommentInput,
         moderation_config: &InternalCommentModerationConfig,
         ip: Option<String>,
+        country_name: Option<String>,
         user_agent: Option<String>,
     ) -> Result<MutationResult, ApiError> {
         let nickname = input.nickname.trim().to_string();
@@ -965,11 +975,11 @@ impl<'a> Database<'a> {
         self.conn
             .execute(
                 "INSERT INTO comments (
-                    id, article_id, parent_id, nickname, email, website, content, status, ip, user_agent, reviewed_by, reviewed_at, reject_reason, created_at, updated_at
+                    id, article_id, parent_id, nickname, email, website, content, status, ip, country_name, user_agent, reviewed_by, reviewed_at, reject_reason, created_at, updated_at
                  ) VALUES (
-                    $1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, NULL, NULL, NULL, NOW(), NOW()
+                    $1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10, NULL, NULL, NULL, NOW(), NOW()
                  )",
-                &[&comment_id, &article_id, &parent_id, &nickname, &email, &website, &content, &ip, &user_agent],
+                &[&comment_id, &article_id, &parent_id, &nickname, &email, &website, &content, &ip, &country_name, &user_agent],
             )
             .map_err(db_error)?;
 
@@ -1705,6 +1715,16 @@ impl<'a> Database<'a> {
         let rate_limit_global_ip_max = input
             .rate_limit_global_ip_max
             .unwrap_or(current.rate_limit_global_ip_max);
+        let geoip_enabled = input.geoip_enabled.unwrap_or(current.geoip_enabled);
+        let geoip_provider = input
+            .geoip_provider
+            .map(|value| normalize_geoip_provider(&value))
+            .unwrap_or_else(|| normalize_geoip_provider(&current.geoip_provider));
+        let geoip_api_key = input
+            .geoip_api_key
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(current.geoip_api_key);
 
         let (low_risk_max_score, high_risk_min_score) =
             normalize_comment_moderation_thresholds(low_risk_max_score, high_risk_min_score);
@@ -1750,8 +1770,9 @@ impl<'a> Database<'a> {
                      rate_limit_enabled = $15, rate_limit_min_interval_seconds = $16,
                      rate_limit_per_article_window_minutes = $17, rate_limit_per_article_email_max = $18, rate_limit_per_article_ip_max = $19,
                      rate_limit_global_window_minutes = $20, rate_limit_global_email_max = $21, rate_limit_global_ip_max = $22,
+                     geoip_enabled = $23, geoip_provider = $24, geoip_api_key = $25,
                      updated_at = NOW()
-                 WHERE id = $23",
+                 WHERE id = $26",
                 &[
                     &enabled,
                     &akismet_enabled,
@@ -1775,6 +1796,9 @@ impl<'a> Database<'a> {
                     &rate_limit_global_window_minutes,
                     &rate_limit_global_email_max,
                     &rate_limit_global_ip_max,
+                    &geoip_enabled,
+                    &geoip_provider,
+                    &geoip_api_key,
                     &"default-comment-moderation",
                 ],
             )

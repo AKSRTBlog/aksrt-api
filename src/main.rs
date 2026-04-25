@@ -1,5 +1,10 @@
 use std::{
-    collections::HashMap, env, error::Error as StdError, net::SocketAddr, path::PathBuf, sync::Arc,
+    collections::HashMap,
+    env,
+    error::Error as StdError,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
     time::Duration as StdDuration,
 };
 
@@ -305,7 +310,7 @@ struct CommentRecord {
     email: String,
     content: String,
     status: String,
-    ip: Option<String>,
+    country_name: Option<String>,
     user_agent: Option<String>,
     created_at: String,
 }
@@ -319,6 +324,7 @@ struct PublicCommentItem {
     avatar_url: String,
     content: String,
     ip: Option<String>,
+    country_name: Option<String>,
     user_agent: Option<String>,
     browser_label: String,
     os_label: String,
@@ -617,6 +623,9 @@ struct InternalCommentModerationConfig {
     rate_limit_global_window_minutes: i32,
     rate_limit_global_email_max: i32,
     rate_limit_global_ip_max: i32,
+    geoip_enabled: bool,
+    geoip_provider: String,
+    geoip_api_key: String,
 }
 
 #[derive(Clone)]
@@ -850,6 +859,9 @@ struct CommentModerationAdminConfigItem {
     rate_limit_global_window_minutes: i32,
     rate_limit_global_email_max: i32,
     rate_limit_global_ip_max: i32,
+    geoip_enabled: bool,
+    geoip_provider: String,
+    geoip_api_key_configured: bool,
 }
 
 #[derive(Deserialize)]
@@ -968,6 +980,9 @@ struct UpdateCommentModerationConfigInput {
     rate_limit_global_window_minutes: Option<i32>,
     rate_limit_global_email_max: Option<i32>,
     rate_limit_global_ip_max: Option<i32>,
+    geoip_enabled: Option<bool>,
+    geoip_provider: Option<String>,
+    geoip_api_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1191,6 +1206,7 @@ struct AdminCommentItem {
     content: String,
     status: String,
     ip: Option<String>,
+    country_name: Option<String>,
     user_agent: Option<String>,
     reviewed_by: Option<String>,
     reviewed_at: Option<String>,
@@ -2224,6 +2240,124 @@ fn detect_comment_os_label(user_agent: Option<&str>) -> String {
     } else {
         "Unknown OS".to_string()
     }
+}
+
+fn is_public_ip(ip: &str) -> bool {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(addr)) => {
+            !addr.is_private()
+                && !addr.is_loopback()
+                && !addr.is_link_local()
+                && !addr.is_broadcast()
+                && !addr.is_unspecified()
+        }
+        Ok(IpAddr::V6(addr)) => {
+            !addr.is_loopback() && !addr.is_unspecified() && !addr.is_unique_local()
+        }
+        Err(_) => false,
+    }
+}
+
+fn country_code_to_name(code: &str) -> Option<&'static str> {
+    match code.trim().to_ascii_uppercase().as_str() {
+        "US" => Some("United States"),
+        "CN" => Some("China"),
+        "JP" => Some("Japan"),
+        "KR" => Some("South Korea"),
+        "GB" => Some("United Kingdom"),
+        "DE" => Some("Germany"),
+        "FR" => Some("France"),
+        "CA" => Some("Canada"),
+        "AU" => Some("Australia"),
+        "SG" => Some("Singapore"),
+        "HK" => Some("Hong Kong"),
+        "TW" => Some("Taiwan"),
+        "RU" => Some("Russia"),
+        "IN" => Some("India"),
+        "BR" => Some("Brazil"),
+        "NL" => Some("Netherlands"),
+        "SE" => Some("Sweden"),
+        "FI" => Some("Finland"),
+        "NO" => Some("Norway"),
+        "IT" => Some("Italy"),
+        "ES" => Some("Spain"),
+        _ => None,
+    }
+}
+
+fn json_string_at_path(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_geoip_country_name(value: &Value) -> Option<String> {
+    for path in [
+        &["country_name"][..],
+        &["countryName"][..],
+        &["country", "name"][..],
+        &["location", "country", "name"][..],
+    ] {
+        if let Some(name) = json_string_at_path(value, path) {
+            return Some(name);
+        }
+    }
+
+    json_string_at_path(value, &["country"]).map(|value| {
+        if value.len() == 2 {
+            country_code_to_name(&value).unwrap_or(value.as_str()).to_string()
+        } else {
+            value
+        }
+    })
+}
+
+fn geoip_lookup_url(provider: &str, ip: &str, api_key: &str) -> String {
+    match normalize_geoip_provider(provider).as_str() {
+        "ipinfo" => {
+            if api_key.trim().is_empty() {
+                format!("https://ipinfo.io/{ip}/json")
+            } else {
+                format!("https://ipinfo.io/{ip}/json?token={}", api_key.trim())
+            }
+        }
+        "ipgeolocation" => {
+            if api_key.trim().is_empty() {
+                format!("https://api.ipgeolocation.io/ipgeo?ip={ip}")
+            } else {
+                format!("https://api.ipgeolocation.io/ipgeo?ip={ip}&apiKey={}", api_key.trim())
+            }
+        }
+        _ => format!("https://ipapi.co/{ip}/json/"),
+    }
+}
+
+fn resolve_comment_country_name(
+    config: &InternalCommentModerationConfig,
+    ip: Option<&str>,
+) -> Option<String> {
+    let ip = ip.map(str::trim).filter(|value| !value.is_empty())?;
+    if !config.geoip_enabled || !is_public_ip(ip) {
+        return None;
+    }
+
+    let client = HttpClient::builder()
+        .timeout(StdDuration::from_secs(2))
+        .user_agent("aksrtblog-rust-api/0.1")
+        .build()
+        .ok()?;
+    let url = geoip_lookup_url(&config.geoip_provider, ip, &config.geoip_api_key);
+    let response = client.get(url).send().ok()?.error_for_status().ok()?;
+    let payload = response.json::<Value>().ok()?;
+
+    extract_geoip_country_name(&payload)
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -3437,6 +3571,14 @@ fn normalize_comment_rate_limit_settings(
     )
 }
 
+fn normalize_geoip_provider(provider: &str) -> String {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "ipinfo" | "ipinfo.io" => "ipinfo".to_string(),
+        "ipgeolocation" | "ipgeolocation.io" | "ipgeolocate" => "ipgeolocation".to_string(),
+        _ => "ipapi".to_string(),
+    }
+}
+
 fn read_internal_comment_moderation_config(
     conn: &mut PgClient,
     fallback_site_url: &str,
@@ -3448,7 +3590,8 @@ fn read_internal_comment_moderation_config(
                     low_risk_max_score, high_risk_min_score, blocked_keywords_json::text,
                     rate_limit_enabled, rate_limit_min_interval_seconds,
                     rate_limit_per_article_window_minutes, rate_limit_per_article_email_max, rate_limit_per_article_ip_max,
-                    rate_limit_global_window_minutes, rate_limit_global_email_max, rate_limit_global_ip_max
+                    rate_limit_global_window_minutes, rate_limit_global_email_max, rate_limit_global_ip_max,
+                    geoip_enabled, geoip_provider, geoip_api_key
              FROM comment_moderation_configs
              WHERE id = $1",
             &[&"default-comment-moderation"],
@@ -3487,6 +3630,9 @@ fn read_internal_comment_moderation_config(
                 rate_limit_global_window_minutes: row.get(19),
                 rate_limit_global_email_max: row.get(20),
                 rate_limit_global_ip_max: row.get(21),
+                geoip_enabled: row.get(22),
+                geoip_provider: row.get(23),
+                geoip_api_key: row.get(24),
             }
         })
         .unwrap_or(InternalCommentModerationConfig {
@@ -3512,6 +3658,9 @@ fn read_internal_comment_moderation_config(
             rate_limit_global_window_minutes: 60,
             rate_limit_global_email_max: 15,
             rate_limit_global_ip_max: 60,
+            geoip_enabled: true,
+            geoip_provider: "ipapi".to_string(),
+            geoip_api_key: String::new(),
         });
 
     if !validate_url(config.akismet_site_url.trim()) {
@@ -3529,6 +3678,7 @@ fn read_internal_comment_moderation_config(
     if config.akismet_blog_lang.trim().is_empty() {
         config.akismet_blog_lang = "zh-CN".to_string();
     }
+    config.geoip_provider = normalize_geoip_provider(&config.geoip_provider);
 
     let (low, high) = normalize_comment_moderation_thresholds(
         config.low_risk_max_score,
@@ -3591,6 +3741,9 @@ fn to_comment_moderation_admin_config_item(
         rate_limit_global_window_minutes: config.rate_limit_global_window_minutes,
         rate_limit_global_email_max: config.rate_limit_global_email_max,
         rate_limit_global_ip_max: config.rate_limit_global_ip_max,
+        geoip_enabled: config.geoip_enabled,
+        geoip_provider: config.geoip_provider,
+        geoip_api_key_configured: !config.geoip_api_key.trim().is_empty(),
     }
 }
 
@@ -5404,6 +5557,8 @@ async fn submit_public_comment(
         validate_geetest_captcha(&state, &mut conn, "comment", input.captcha.as_ref())?;
         let moderation_config =
             read_internal_comment_moderation_config(&mut conn, &state.config.public_site_url)?;
+        let country_name =
+            resolve_comment_country_name(&moderation_config, client_meta.ip.as_deref());
         let notification = PendingCommentNotification {
             article_title: article.title.clone(),
             article_slug: article.slug.clone(),
@@ -5419,6 +5574,7 @@ async fn submit_public_comment(
             input,
             &moderation_config,
             client_meta.ip.clone(),
+            country_name,
             client_meta.user_agent.clone(),
         )?;
         let moderation = evaluate_comment_moderation(
@@ -6291,7 +6447,7 @@ fn load_admin_comment_items(conn: &mut PgClient) -> Result<Vec<AdminCommentItem>
     let rows = conn
         .query(
             "SELECT c.id, c.article_id, a.title, a.slug, c.parent_id, c.nickname, c.email, c.website, c.content, c.status,
-                    c.ip, c.user_agent, c.reviewed_by, c.reviewed_at::text, c.reject_reason,
+                    c.ip, c.country_name, c.user_agent, c.reviewed_by, c.reviewed_at::text, c.reject_reason,
                     c.moderation_risk_level, c.moderation_risk_score, c.moderation_summary,
                     c.moderation_akismet_json::text, c.moderation_ai_json::text, c.moderation_pipeline_version,
                     c.created_at::text, c.updated_at::text
@@ -6338,18 +6494,19 @@ fn load_admin_comment_items(conn: &mut PgClient) -> Result<Vec<AdminCommentItem>
                 content: row.get(8),
                 status: row.get(9),
                 ip: row.get(10),
-                user_agent: row.get(11),
-                reviewed_by: row.get(12),
-                reviewed_at: row.get(13),
-                reject_reason: row.get(14),
-                moderation_risk_level: row.get(15),
-                moderation_risk_score: row.get(16),
-                moderation_summary: row.get(17),
-                moderation_akismet_raw: row.get(18),
-                moderation_ai_raw: row.get(19),
-                moderation_pipeline_version: row.get(20),
-                created_at: row.get(21),
-                updated_at: row.get(22),
+                country_name: row.get(11),
+                user_agent: row.get(12),
+                reviewed_by: row.get(13),
+                reviewed_at: row.get(14),
+                reject_reason: row.get(15),
+                moderation_risk_level: row.get(16),
+                moderation_risk_score: row.get(17),
+                moderation_summary: row.get(18),
+                moderation_akismet_raw: row.get(19),
+                moderation_ai_raw: row.get(20),
+                moderation_pipeline_version: row.get(21),
+                created_at: row.get(22),
+                updated_at: row.get(23),
             }
         })
         .collect())
@@ -8142,7 +8299,7 @@ fn load_public_comments(
 ) -> Result<Vec<PublicCommentItem>, ApiError> {
     let rows = conn
         .query(
-            "SELECT id, article_id, parent_id, nickname, email, content, status, ip, user_agent, created_at::text
+            "SELECT id, article_id, parent_id, nickname, email, content, status, country_name, user_agent, created_at::text
              FROM comments
              WHERE article_id = $1 AND status = 'approved'
              ORDER BY created_at ASC",
@@ -8158,7 +8315,7 @@ fn load_public_comments(
             email: row.get(4),
             content: row.get(5),
             status: row.get(6),
-            ip: row.get(7),
+            country_name: row.get(7),
             user_agent: row.get(8),
             created_at: row.get(9),
         })
@@ -8175,7 +8332,8 @@ fn load_public_comments(
                 nickname: comment.nickname.clone(),
                 avatar_url: cravatar_url(&comment.email),
                 content: comment.content.clone(),
-                ip: comment.ip.clone(),
+                ip: None,
+                country_name: comment.country_name.clone(),
                 user_agent: comment.user_agent.clone(),
                 browser_label: detect_comment_browser_label(comment.user_agent.as_deref()),
                 os_label: detect_comment_os_label(comment.user_agent.as_deref()),

@@ -1,0 +1,7 @@
+ALTER TABLE comments
+  ADD COLUMN IF NOT EXISTS country_name TEXT;
+
+ALTER TABLE comment_moderation_configs
+  ADD COLUMN IF NOT EXISTS geoip_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS geoip_provider TEXT NOT NULL DEFAULT 'ipapi',
+  ADD COLUMN IF NOT EXISTS geoip_api_key TEXT NOT NULL DEFAULT '';

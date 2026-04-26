@@ -96,6 +96,8 @@ struct NavigationItemRecord {
     id: String,
     label: String,
     href: String,
+    #[serde(default)]
+    icon_url: Option<String>,
     sort_order: i64,
     enabled: bool,
 }
@@ -149,6 +151,7 @@ struct NavigationItemItem {
     id: String,
     label: String,
     href: String,
+    icon_url: Option<String>,
     sort_order: i64,
     enabled: bool,
 }
@@ -886,6 +889,7 @@ struct UpdateNavigationItemInput {
     id: Option<String>,
     label: String,
     href: String,
+    icon_url: Option<String>,
     sort_order: i64,
     enabled: bool,
 }
@@ -4987,6 +4991,7 @@ fn read_public_site_settings(
             id: item.id.clone(),
             label: item.label.clone(),
             href: item.href.clone(),
+            icon_url: item.icon_url.clone(),
             sort_order: item.sort_order,
             enabled: item.enabled,
         })

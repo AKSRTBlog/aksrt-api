@@ -1319,6 +1319,7 @@ impl<'a> Database<'a> {
             .map(|item| {
                 let label = item.label.trim().to_string();
                 let href = item.href.trim().to_string();
+                let icon_url = normalize_optional_text(item.icon_url);
                 if label.is_empty() || href.is_empty() {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
@@ -1326,10 +1327,21 @@ impl<'a> Database<'a> {
                         "Navigation item is invalid",
                     ));
                 }
+                if let Some(icon) = icon_url.as_ref() {
+                    require_length(icon, 1, 120, "INVALID_NAVIGATION_ICON", "Navigation icon is too long")?;
+                    if !icon.starts_with("fa6-") || !icon.contains(':') {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "INVALID_NAVIGATION_ICON",
+                            "Navigation icon must use a Font Awesome 6 icon name",
+                        ));
+                    }
+                }
                 Ok(NavigationItemRecord {
                     id: item.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
                     label,
                     href,
+                    icon_url,
                     sort_order: item.sort_order.max(0),
                     enabled: item.enabled,
                 })
